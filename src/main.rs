@@ -96,11 +96,11 @@ async fn main() -> Result<()> {
 
     let mut options = vec![
         MountOption::FSName("net_fuse".to_string()),
-        MountOption::AutoUnmount,
         MountOption::DefaultPermissions,
     ];
     if config.allow_other {
         options.push(MountOption::AllowOther);
+        options.push(MountOption::AutoUnmount);
     }
 
     info!("Mounting at {:?}", config.mount_point);
