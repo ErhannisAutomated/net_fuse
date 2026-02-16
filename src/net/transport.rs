@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use quinn::{Connection, Endpoint};
 use tokio::sync::{mpsc, RwLock};
@@ -39,6 +40,18 @@ impl Transport {
         incoming_tx: mpsc::Sender<(Uuid, Message)>,
         peer_connected_tx: mpsc::Sender<Uuid>,
     ) -> anyhow::Result<Self> {
+        // Configure keepalive to prevent idle timeout
+        let mut server_transport = quinn::TransportConfig::default();
+        server_transport.keep_alive_interval(Some(Duration::from_secs(10)));
+        let mut client_transport = quinn::TransportConfig::default();
+        client_transport.keep_alive_interval(Some(Duration::from_secs(10)));
+
+        let mut server_config = server_config;
+        server_config.transport_config(Arc::new(server_transport));
+
+        let mut client_config = client_config;
+        client_config.transport_config(Arc::new(client_transport));
+
         let mut endpoint = Endpoint::server(server_config, bind_addr)?;
         endpoint.set_default_client_config(client_config);
 
