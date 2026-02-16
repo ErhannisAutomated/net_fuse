@@ -22,6 +22,10 @@ pub struct Transport {
     node_id: Uuid,
     node_name: String,
     connections: Arc<RwLock<HashMap<Uuid, PeerConn>>>,
+    /// Channel for forwarding incoming messages from peers to the SyncEngine.
+    incoming_tx: mpsc::Sender<(Uuid, Message)>,
+    /// Channel to notify when a new peer is connected (for initial sync).
+    peer_connected_tx: mpsc::Sender<Uuid>,
 }
 
 impl Transport {
@@ -32,6 +36,8 @@ impl Transport {
         node_name: String,
         server_config: quinn::ServerConfig,
         client_config: quinn::ClientConfig,
+        incoming_tx: mpsc::Sender<(Uuid, Message)>,
+        peer_connected_tx: mpsc::Sender<Uuid>,
     ) -> anyhow::Result<Self> {
         let mut endpoint = Endpoint::server(server_config, bind_addr)?;
         endpoint.set_default_client_config(client_config);
@@ -41,6 +47,8 @@ impl Transport {
             node_id,
             node_name,
             connections: Arc::new(RwLock::new(HashMap::new())),
+            incoming_tx,
+            peer_connected_tx,
         })
     }
 
@@ -94,6 +102,10 @@ impl Transport {
             anyhow::bail!("connected to self, closing");
         }
 
+        // Start listening for incoming messages on this connection
+        let conn_clone = connection.clone();
+        self.spawn_stream_listener(peer_id, conn_clone);
+
         self.connections.write().await.insert(
             peer_id,
             PeerConn {
@@ -102,6 +114,9 @@ impl Transport {
                 name: peer_name.clone(),
             },
         );
+
+        // Notify SyncEngine of new peer
+        let _ = self.peer_connected_tx.send(peer_id).await;
 
         Ok((peer_id, peer_name))
     }
@@ -149,6 +164,10 @@ impl Transport {
             anyhow::bail!("incoming connection from self, closing");
         }
 
+        // Start listening for incoming messages on this connection
+        let conn_clone = connection.clone();
+        self.spawn_stream_listener(peer_id, conn_clone);
+
         self.connections.write().await.insert(
             peer_id,
             PeerConn {
@@ -158,7 +177,47 @@ impl Transport {
             },
         );
 
+        // Notify SyncEngine of new peer
+        let _ = self.peer_connected_tx.send(peer_id).await;
+
         Ok((peer_id, peer_name))
+    }
+
+    /// Spawn a background task that listens for incoming unidirectional streams
+    /// on a connection and forwards messages to the SyncEngine.
+    fn spawn_stream_listener(&self, peer_id: Uuid, connection: Connection) {
+        let incoming_tx = self.incoming_tx.clone();
+
+        tokio::spawn(async move {
+            loop {
+                match connection.accept_uni().await {
+                    Ok(mut recv) => {
+                        let tx = incoming_tx.clone();
+                        tokio::spawn(async move {
+                            match protocol::read_message(&mut recv).await {
+                                Ok(msg) => {
+                                    debug!(%peer_id, ?msg, "Received message from peer");
+                                    if let Err(e) = tx.send((peer_id, msg)).await {
+                                        debug!("Failed to forward message: {}", e);
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(%peer_id, error = %e, "Error reading from peer stream");
+                                }
+                            }
+                        });
+                    }
+                    Err(quinn::ConnectionError::ApplicationClosed(_)) => {
+                        info!(%peer_id, "Peer connection closed");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(%peer_id, error = %e, "Stream accept error, peer disconnected");
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     /// Accept incoming connections in a loop. Sends (peer_id, peer_name)

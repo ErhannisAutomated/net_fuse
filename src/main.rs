@@ -14,6 +14,7 @@ use net_fuse::net::discovery::Discovery;
 use net_fuse::net::peer_manager::PeerManager;
 use net_fuse::net::transport::Transport;
 use net_fuse::store::BlobStore;
+use net_fuse::sync::SyncEngine;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -41,7 +42,7 @@ async fn main() -> Result<()> {
     let store = Arc::new(BlobStore::new(config.blobs_dir.clone())?);
     info!("Blob store at {:?}", config.blobs_dir);
 
-    // --- Phase 2: Networking ---
+    // --- Phase 2+3: Networking & Sync ---
 
     // Load or generate TLS identity
     let identity = NodeIdentity::load_or_generate(
@@ -53,6 +54,10 @@ async fn main() -> Result<()> {
     let client_config = identity.build_client_config()?;
     info!("TLS identity loaded");
 
+    // Create channels for Transport -> SyncEngine communication
+    let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel(256);
+    let (peer_connected_tx, peer_connected_rx) = tokio::sync::mpsc::channel(32);
+
     // Create QUIC transport
     let bind_addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     let transport = Arc::new(
@@ -62,6 +67,8 @@ async fn main() -> Result<()> {
             config.node_name.clone(),
             server_config,
             client_config,
+            incoming_tx,
+            peer_connected_tx,
         )
         .await?,
     );
@@ -90,9 +97,24 @@ async fn main() -> Result<()> {
         peer_mgr.handle_discoveries(discovered_rx).await;
     });
 
+    // --- Phase 3: Sync Engine ---
+
+    // Create the FUSE -> SyncEngine channel
+    let (sync_tx, sync_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    // Start the sync engine
+    let sync_engine = SyncEngine::new(
+        db.clone(),
+        transport.clone(),
+        sync_rx,
+        incoming_rx,
+        peer_connected_rx,
+    );
+    tokio::spawn(sync_engine.run());
+
     // --- Mount FUSE filesystem ---
 
-    let fs = NetFuseFS::new(db, store);
+    let fs = NetFuseFS::new(db, store, Some(sync_tx));
 
     let mut options = vec![
         MountOption::FSName("net_fuse".to_string()),

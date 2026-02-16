@@ -10,6 +10,17 @@ use rusqlite::{Connection, params};
 use crate::{BlobHash, NetFuseError, Result};
 use types::{BlobRecord, EntryKind, FileEntry, Timestamp, VectorClock};
 
+/// Result of applying a remote update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyResult {
+    /// The remote update was applied (inserted or replaced).
+    Applied,
+    /// The remote update was ignored (local is newer or equal).
+    Ignored,
+    /// The update caused a conflict (both versions preserved).
+    Conflict,
+}
+
 /// Thread-safe SQLite-backed metadata database.
 pub struct MetadataDb {
     conn: Mutex<Connection>,
@@ -210,6 +221,118 @@ impl MetadataDb {
             .query_map([], |row| row.get(0))?
             .collect::<std::result::Result<Vec<String>, _>>()?;
         Ok(paths)
+    }
+
+    /// Get all file entries in the database (for full sync).
+    pub fn all_entries(&self) -> Result<Vec<FileEntry>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT path, parent_path, hash, size, mtime_secs, mtime_nanos,
+                    ctime_secs, ctime_nanos, permissions, kind, vclock,
+                    origin_node, conflict_id
+             FROM files ORDER BY path",
+        )?;
+
+        let entries = stmt
+            .query_map([], |row| row_to_file_entry(row))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(entries)
+    }
+
+    /// Apply a remote file entry update. Returns what happened.
+    ///
+    /// - If no local entry exists, insert the remote one.
+    /// - If local vclock < remote vclock, replace with remote.
+    /// - If local vclock > remote vclock, ignore (we're newer).
+    /// - If concurrent (neither dominates), create a conflict entry.
+    pub fn apply_remote_update(&self, remote: &FileEntry) -> Result<ApplyResult> {
+        let local = self.get_entry(&remote.path)?;
+
+        match local {
+            None => {
+                // No local entry — just insert
+                self.upsert_entry(remote)?;
+                Ok(ApplyResult::Applied)
+            }
+            Some(local_entry) => {
+                match local_entry.vclock.partial_cmp(&remote.vclock) {
+                    Some(std::cmp::Ordering::Less) => {
+                        // Remote dominates — replace
+                        self.upsert_entry(remote)?;
+                        Ok(ApplyResult::Applied)
+                    }
+                    Some(std::cmp::Ordering::Equal) | Some(std::cmp::Ordering::Greater) => {
+                        // Local is equal or newer — ignore
+                        Ok(ApplyResult::Ignored)
+                    }
+                    None => {
+                        // Concurrent — conflict!
+                        self.create_conflict(&local_entry, remote)?;
+                        Ok(ApplyResult::Conflict)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Apply a remote delete. Returns what happened.
+    pub fn apply_remote_delete(
+        &self,
+        path: &str,
+        remote_vclock: &types::VectorClock,
+    ) -> Result<ApplyResult> {
+        let local = self.get_entry(path)?;
+
+        match local {
+            None => {
+                // Already gone
+                Ok(ApplyResult::Ignored)
+            }
+            Some(local_entry) => {
+                match local_entry.vclock.partial_cmp(remote_vclock) {
+                    Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) => {
+                        // Remote dominates or equal — delete
+                        self.delete_entry(path)?;
+                        Ok(ApplyResult::Applied)
+                    }
+                    Some(std::cmp::Ordering::Greater) => {
+                        // Local is newer — ignore
+                        Ok(ApplyResult::Ignored)
+                    }
+                    None => {
+                        // Concurrent — keep local, ignore delete
+                        // (local was modified concurrently, preserve it)
+                        Ok(ApplyResult::Ignored)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Create conflict entries for two concurrent versions.
+    /// Keeps the local entry at the original path (with merged vclock),
+    /// and adds a `.conflict.<origin-node-short>` entry for the remote version.
+    fn create_conflict(&self, local: &FileEntry, remote: &FileEntry) -> Result<()> {
+        // Merge vclocks for the local entry
+        let mut merged_vclock = local.vclock.clone();
+        merged_vclock.merge(&remote.vclock);
+
+        let mut local_updated = local.clone();
+        local_updated.vclock = merged_vclock.clone();
+        local_updated.conflict_id = Some(uuid::Uuid::new_v4());
+        self.upsert_entry(&local_updated)?;
+
+        // Create conflict entry for the remote version
+        let origin_short = &remote.origin_node.to_string()[..8];
+        let conflict_path = format!("{}.conflict.{}", remote.path, origin_short);
+        let mut conflict_entry = remote.clone();
+        conflict_entry.path = conflict_path;
+        conflict_entry.vclock = merged_vclock;
+        conflict_entry.conflict_id = Some(uuid::Uuid::new_v4());
+        self.upsert_entry(&conflict_entry)?;
+
+        Ok(())
     }
 
     /// Rename: update path and parent_path for an entry (and children if directory).

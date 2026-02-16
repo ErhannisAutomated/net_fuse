@@ -13,9 +13,10 @@ use fuser::{
 use parking_lot::Mutex;
 use tracing::{debug, error, warn};
 
-use crate::metadata::types::{EntryKind, FileEntry, Timestamp};
+use crate::metadata::types::{EntryKind, FileEntry, Timestamp, VectorClock};
 use crate::metadata::MetadataDb;
 use crate::store::BlobStore;
+use crate::sync::SyncEvent;
 use handle::HandleTable;
 use inode::InodeMap;
 
@@ -28,12 +29,17 @@ pub struct NetFuseFS {
     store: Arc<BlobStore>,
     inodes: Mutex<InodeMap>,
     handles: Mutex<HandleTable>,
+    sync_tx: Option<tokio::sync::mpsc::UnboundedSender<SyncEvent>>,
     uid: u32,
     gid: u32,
 }
 
 impl NetFuseFS {
-    pub fn new(db: Arc<MetadataDb>, store: Arc<BlobStore>) -> Self {
+    pub fn new(
+        db: Arc<MetadataDb>,
+        store: Arc<BlobStore>,
+        sync_tx: Option<tokio::sync::mpsc::UnboundedSender<SyncEvent>>,
+    ) -> Self {
         let mut inode_map = InodeMap::new();
         // Rebuild inode map from existing DB entries
         if let Ok(paths) = db.all_paths() {
@@ -48,8 +54,18 @@ impl NetFuseFS {
             store,
             inodes: Mutex::new(inode_map),
             handles: Mutex::new(HandleTable::new()),
+            sync_tx,
             uid,
             gid,
+        }
+    }
+
+    /// Send a sync event (fire-and-forget).
+    fn send_sync(&self, event: SyncEvent) {
+        if let Some(ref tx) = self.sync_tx {
+            if let Err(e) = tx.send(event) {
+                warn!("Failed to send sync event: {}", e);
+            }
         }
     }
 
@@ -241,6 +257,8 @@ impl Filesystem for NetFuseFS {
             return;
         }
 
+        self.send_sync(SyncEvent::FileUpdated(entry.clone()));
+
         let attr = self.entry_to_attr(&entry, ino);
         reply.attr(&TTL, &attr);
     }
@@ -337,6 +355,8 @@ impl Filesystem for NetFuseFS {
             reply.error(libc::EIO);
             return;
         }
+
+        self.send_sync(SyncEvent::DirCreated(entry.clone()));
 
         let ino = self.inodes.lock().get_or_insert(&path);
         let attr = self.entry_to_attr(&entry, ino);
@@ -539,6 +559,8 @@ impl Filesystem for NetFuseFS {
                     return;
                 }
 
+                self.send_sync(SyncEvent::FileUpdated(entry.clone()));
+
                 // Register the blob
                 let blob_path = format!("{}/{}", &hex::encode(&hash)[..2], hex::encode(&hash));
                 let _ = self.db.register_blob(&hash, size, &blob_path);
@@ -640,8 +662,11 @@ impl Filesystem for NetFuseFS {
             return;
         };
 
-        // Get entry to deref its blob
+        // Get entry to deref its blob and capture vclock for sync
+        let mut delete_vclock = VectorClock::new();
         if let Ok(Some(entry)) = self.db.get_entry(&path) {
+            delete_vclock = entry.vclock.clone();
+            delete_vclock.increment(self.db.node_id());
             if let Some(hash) = entry.hash {
                 let _ = self.db.deref_blob(&hash);
             }
@@ -652,6 +677,12 @@ impl Filesystem for NetFuseFS {
             reply.error(libc::EIO);
             return;
         }
+
+        self.send_sync(SyncEvent::FileDeleted {
+            path: path.clone(),
+            vclock: delete_vclock,
+            origin_node: self.db.node_id(),
+        });
 
         self.inodes.lock().remove_path(&path);
         reply.ok();
@@ -677,11 +708,24 @@ impl Filesystem for NetFuseFS {
             _ => {}
         }
 
+        // Capture vclock before deleting
+        let mut delete_vclock = VectorClock::new();
+        if let Ok(Some(entry)) = self.db.get_entry(&path) {
+            delete_vclock = entry.vclock.clone();
+            delete_vclock.increment(self.db.node_id());
+        }
+
         if let Err(e) = self.db.delete_entry(&path) {
             error!("rmdir delete error: {}", e);
             reply.error(libc::EIO);
             return;
         }
+
+        self.send_sync(SyncEvent::DirDeleted {
+            path: path.clone(),
+            vclock: delete_vclock,
+            origin_node: self.db.node_id(),
+        });
 
         self.inodes.lock().remove_path(&path);
         reply.ok();
@@ -737,6 +781,14 @@ impl Filesystem for NetFuseFS {
             error!("rename error: {}", e);
             reply.error(libc::EIO);
             return;
+        }
+
+        // Send sync event with the new entry
+        if let Ok(Some(new_entry)) = self.db.get_entry(&new_path) {
+            self.send_sync(SyncEvent::Renamed {
+                old_path: old_path.clone(),
+                new_entry,
+            });
         }
 
         self.inodes.lock().rename(&old_path, &new_path);
