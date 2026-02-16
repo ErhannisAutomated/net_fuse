@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use fuser::MountOption;
 use tracing::info;
@@ -79,8 +79,10 @@ async fn main() -> Result<()> {
     });
 
     // Start mDNS discovery
-    let discovery = Discovery::new(node_id, &config.node_name, config.port)?;
-    let discovered_rx = discovery.browse()?;
+    let discovery = Discovery::new(node_id, &config.node_name, config.port)
+        .context("mDNS discovery setup")?;
+    let discovered_rx = discovery.browse()
+        .context("mDNS browse")?;
 
     // Start peer manager (handles mDNS discoveries -> outgoing connections)
     let peer_mgr = PeerManager::new(transport.clone());
@@ -104,7 +106,8 @@ async fn main() -> Result<()> {
     info!("Mounting at {:?}", config.mount_point);
 
     // spawn_mount2 runs FUSE in a background thread, returns a session guard
-    let _session = fuser::spawn_mount2(fs, &config.mount_point, &options)?;
+    let _session = fuser::spawn_mount2(fs, &config.mount_point, &options)
+        .context(format!("FUSE mount at {:?}", config.mount_point))?;
 
     // Wait for Ctrl-C
     tokio::signal::ctrl_c().await?;
