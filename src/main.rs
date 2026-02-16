@@ -69,6 +69,7 @@ async fn main() -> Result<()> {
             client_config,
             incoming_tx,
             peer_connected_tx,
+            store.clone(),
         )
         .await?,
     );
@@ -114,7 +115,8 @@ async fn main() -> Result<()> {
 
     // --- Mount FUSE filesystem ---
 
-    let fs = NetFuseFS::new(db, store, Some(sync_tx));
+    let rt_handle = tokio::runtime::Handle::current();
+    let fs = NetFuseFS::new(db, store, Some(sync_tx), Some(transport.clone()), Some(rt_handle));
 
     let mut options = vec![
         MountOption::FSName("net_fuse".to_string()),

@@ -87,7 +87,7 @@ pub async fn read_message(
 }
 
 /// Read exactly `buf.len()` bytes from a QUIC RecvStream.
-async fn read_exact(recv: &mut quinn::RecvStream, buf: &mut [u8]) -> anyhow::Result<()> {
+pub(crate) async fn read_exact(recv: &mut quinn::RecvStream, buf: &mut [u8]) -> anyhow::Result<()> {
     let mut offset = 0;
     while offset < buf.len() {
         match recv.read(&mut buf[offset..]).await? {

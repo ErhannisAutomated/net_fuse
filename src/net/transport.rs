@@ -8,6 +8,9 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::store::BlobStore;
+use crate::BlobHash;
+
 use super::protocol::{self, Message, PROTOCOL_VERSION};
 
 /// A connected peer.
@@ -27,6 +30,8 @@ pub struct Transport {
     incoming_tx: mpsc::Sender<(Uuid, Message)>,
     /// Channel to notify when a new peer is connected (for initial sync).
     peer_connected_tx: mpsc::Sender<Uuid>,
+    /// Blob store for serving blob requests from peers.
+    blob_store: Arc<BlobStore>,
 }
 
 impl Transport {
@@ -39,6 +44,7 @@ impl Transport {
         client_config: quinn::ClientConfig,
         incoming_tx: mpsc::Sender<(Uuid, Message)>,
         peer_connected_tx: mpsc::Sender<Uuid>,
+        blob_store: Arc<BlobStore>,
     ) -> anyhow::Result<Self> {
         // Configure keepalive to prevent idle timeout
         let mut server_transport = quinn::TransportConfig::default();
@@ -62,6 +68,7 @@ impl Transport {
             connections: Arc::new(RwLock::new(HashMap::new())),
             incoming_tx,
             peer_connected_tx,
+            blob_store,
         })
     }
 
@@ -196,14 +203,16 @@ impl Transport {
         Ok((peer_id, peer_name))
     }
 
-    /// Spawn a background task that listens for incoming unidirectional streams
-    /// on a connection and forwards messages to the SyncEngine.
+    /// Spawn background tasks that listen for incoming streams on a connection.
+    /// - Unidirectional streams carry sync messages forwarded to SyncEngine.
+    /// - Bidirectional streams carry blob requests served from the local BlobStore.
     fn spawn_stream_listener(&self, peer_id: Uuid, connection: Connection) {
+        // Uni-directional: sync messages
         let incoming_tx = self.incoming_tx.clone();
-
+        let conn_uni = connection.clone();
         tokio::spawn(async move {
             loop {
-                match connection.accept_uni().await {
+                match conn_uni.accept_uni().await {
                     Ok(mut recv) => {
                         let tx = incoming_tx.clone();
                         tokio::spawn(async move {
@@ -221,16 +230,79 @@ impl Transport {
                         });
                     }
                     Err(quinn::ConnectionError::ApplicationClosed(_)) => {
-                        info!(%peer_id, "Peer connection closed");
+                        info!(%peer_id, "Peer connection closed (uni)");
                         break;
                     }
                     Err(e) => {
-                        warn!(%peer_id, error = %e, "Stream accept error, peer disconnected");
+                        warn!(%peer_id, error = %e, "Uni stream accept error, peer disconnected");
                         break;
                     }
                 }
             }
         });
+
+        // Bi-directional: blob requests
+        let blob_store = self.blob_store.clone();
+        tokio::spawn(async move {
+            loop {
+                match connection.accept_bi().await {
+                    Ok((mut send, mut recv)) => {
+                        let store = blob_store.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                Self::handle_bi_stream(peer_id, &mut send, &mut recv, &store).await
+                            {
+                                warn!(%peer_id, error = %e, "Error handling bi-stream");
+                            }
+                        });
+                    }
+                    Err(quinn::ConnectionError::ApplicationClosed(_)) => {
+                        info!(%peer_id, "Peer connection closed (bi)");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(%peer_id, error = %e, "Bi stream accept error, peer disconnected");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Handle a single incoming bi-directional stream (blob request/response).
+    async fn handle_bi_stream(
+        peer_id: Uuid,
+        send: &mut quinn::SendStream,
+        recv: &mut quinn::RecvStream,
+        store: &BlobStore,
+    ) -> anyhow::Result<()> {
+        let msg = protocol::read_message(recv).await?;
+
+        match msg {
+            Message::BlobRequest { hash } => {
+                let hex_hash = hex::encode(hash);
+                if store.has(&hash) {
+                    let data = store.get(&hash)?;
+                    let size = data.len() as u64;
+                    debug!(%peer_id, %hex_hash, size, "Serving blob to peer");
+
+                    let resp = Message::BlobResponse { hash, size };
+                    protocol::write_message(send, &resp).await?;
+                    send.write_all(&data).await?;
+                    send.finish()?;
+                } else {
+                    debug!(%peer_id, %hex_hash, "Blob not found, sending BlobNotFound");
+                    let resp = Message::BlobNotFound { hash };
+                    protocol::write_message(send, &resp).await?;
+                    send.finish()?;
+                }
+            }
+            other => {
+                warn!(%peer_id, ?other, "Unexpected message on bi-stream");
+            }
+        }
+
+        Ok(())
     }
 
     /// Accept incoming connections in a loop. Sends (peer_id, peer_name)
@@ -328,6 +400,34 @@ impl Transport {
     /// Get our local listen address.
     pub fn local_addr(&self) -> anyhow::Result<SocketAddr> {
         Ok(self.endpoint.local_addr()?)
+    }
+
+    /// Fetch a blob from a specific peer by opening a bi-directional stream.
+    pub async fn fetch_blob(&self, peer_id: Uuid, hash: &BlobHash) -> anyhow::Result<Vec<u8>> {
+        let connections = self.connections.read().await;
+        let peer = connections
+            .get(&peer_id)
+            .ok_or_else(|| anyhow::anyhow!("not connected to peer {}", peer_id))?;
+
+        let (mut send, mut recv) = peer.connection.open_bi().await?;
+        drop(connections);
+
+        let req = Message::BlobRequest { hash: *hash };
+        protocol::write_message(&mut send, &req).await?;
+        send.finish()?;
+
+        let resp = protocol::read_message(&mut recv).await?;
+        match resp {
+            Message::BlobResponse { hash: _, size } => {
+                let mut data = vec![0u8; size as usize];
+                protocol::read_exact(&mut recv, &mut data).await?;
+                Ok(data)
+            }
+            Message::BlobNotFound { .. } => {
+                anyhow::bail!("peer {} does not have blob {}", peer_id, hex::encode(hash))
+            }
+            other => anyhow::bail!("unexpected response to BlobRequest: {:?}", other),
+        }
     }
 
     /// Disconnect from a specific peer.

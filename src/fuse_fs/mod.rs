@@ -15,6 +15,7 @@ use tracing::{debug, error, warn};
 
 use crate::metadata::types::{EntryKind, FileEntry, Timestamp, VectorClock};
 use crate::metadata::MetadataDb;
+use crate::net::transport::Transport;
 use crate::store::BlobStore;
 use crate::sync::SyncEvent;
 use handle::HandleTable;
@@ -30,6 +31,10 @@ pub struct NetFuseFS {
     inodes: Mutex<InodeMap>,
     handles: Mutex<HandleTable>,
     sync_tx: Option<tokio::sync::mpsc::UnboundedSender<SyncEvent>>,
+    /// Transport for fetching blobs from remote peers (Phase 4).
+    transport: Option<Arc<Transport>>,
+    /// Tokio runtime handle for blocking on async fetch from FUSE threads.
+    rt_handle: Option<tokio::runtime::Handle>,
     uid: u32,
     gid: u32,
 }
@@ -39,6 +44,8 @@ impl NetFuseFS {
         db: Arc<MetadataDb>,
         store: Arc<BlobStore>,
         sync_tx: Option<tokio::sync::mpsc::UnboundedSender<SyncEvent>>,
+        transport: Option<Arc<Transport>>,
+        rt_handle: Option<tokio::runtime::Handle>,
     ) -> Self {
         let mut inode_map = InodeMap::new();
         // Rebuild inode map from existing DB entries
@@ -55,6 +62,8 @@ impl NetFuseFS {
             inodes: Mutex::new(inode_map),
             handles: Mutex::new(HandleTable::new()),
             sync_tx,
+            transport,
+            rt_handle,
             uid,
             gid,
         }
@@ -114,6 +123,57 @@ impl NetFuseFS {
         } else {
             Some(format!("{}/{}", parent_path, name))
         }
+    }
+
+    /// Try to fetch a blob from peers. Tries the origin node first, then others.
+    async fn fetch_from_peers(
+        transport: &Transport,
+        origin_node: uuid::Uuid,
+        hash: &crate::BlobHash,
+    ) -> anyhow::Result<Vec<u8>> {
+        // Try origin node first
+        if transport.is_connected(&origin_node).await {
+            match transport.fetch_blob(origin_node, hash).await {
+                Ok(data) => {
+                    debug!(
+                        origin = %origin_node,
+                        hash = %hex::encode(hash),
+                        "Fetched blob from origin node"
+                    );
+                    return Ok(data);
+                }
+                Err(e) => {
+                    debug!(
+                        origin = %origin_node,
+                        error = %e,
+                        "Origin node fetch failed, trying others"
+                    );
+                }
+            }
+        }
+
+        // Try all other connected peers
+        let peers = transport.connected_peers().await;
+        for (peer_id, _) in peers {
+            if peer_id == origin_node {
+                continue;
+            }
+            match transport.fetch_blob(peer_id, hash).await {
+                Ok(data) => {
+                    debug!(
+                        peer = %peer_id,
+                        hash = %hex::encode(hash),
+                        "Fetched blob from peer"
+                    );
+                    return Ok(data);
+                }
+                Err(e) => {
+                    debug!(peer = %peer_id, error = %e, "Peer fetch failed");
+                }
+            }
+        }
+
+        anyhow::bail!("no peer has blob {}", hex::encode(hash))
     }
 
     /// Get the parent path of a given path.
@@ -637,22 +697,48 @@ impl Filesystem for NetFuseFS {
         };
 
         // Try to read from local store
-        match self.store.get(&hash) {
+        let data = match self.store.get(&hash) {
             Ok(data) => {
                 let _ = self.db.touch_blob(&hash);
-                let start = offset as usize;
-                if start >= data.len() {
-                    reply.data(&[]);
-                } else {
-                    let end = (start + size as usize).min(data.len());
-                    reply.data(&data[start..end]);
-                }
+                data
             }
             Err(_) => {
-                // Phase 1: no network fetch, return EIO
-                warn!("blob not found locally: {}", hex::encode(hash));
-                reply.error(libc::EIO);
+                // Blob not local — try fetching from a peer
+                if let (Some(transport), Some(handle)) = (&self.transport, &self.rt_handle) {
+                    let origin = entry.origin_node;
+                    match handle.block_on(Self::fetch_from_peers(transport, origin, &hash)) {
+                        Ok(data) => {
+                            // Cache the blob locally
+                            if let Ok((_, blob_size)) = self.store.store_bytes(&data) {
+                                let blob_path = format!(
+                                    "{}/{}",
+                                    &hex::encode(hash)[..2],
+                                    hex::encode(hash)
+                                );
+                                let _ = self.db.register_blob(&hash, blob_size, &blob_path);
+                            }
+                            data
+                        }
+                        Err(e) => {
+                            warn!("blob fetch failed for {}: {}", hex::encode(hash), e);
+                            reply.error(libc::EIO);
+                            return;
+                        }
+                    }
+                } else {
+                    warn!("blob not found locally: {}", hex::encode(hash));
+                    reply.error(libc::EIO);
+                    return;
+                }
             }
+        };
+
+        let start = offset as usize;
+        if start >= data.len() {
+            reply.data(&[]);
+        } else {
+            let end = (start + size as usize).min(data.len());
+            reply.data(&data[start..end]);
         }
     }
 
