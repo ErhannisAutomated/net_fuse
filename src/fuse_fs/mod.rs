@@ -408,6 +408,7 @@ impl Filesystem for NetFuseFS {
         drop(inodes);
 
         let writable = (flags & libc::O_ACCMODE) != libc::O_RDONLY;
+        let truncate = (flags & libc::O_TRUNC) != 0;
 
         if writable {
             // Create a temp file and pre-populate with existing content
@@ -420,12 +421,14 @@ impl Filesystem for NetFuseFS {
                 }
             };
 
-            // Copy existing blob content to temp file (if any)
-            if let Ok(Some(entry)) = self.db.get_entry(&path) {
-                if let Some(hash) = entry.hash {
-                    if let Ok(data) = self.store.get(&hash) {
-                        let _ = temp_file.write_all(&data);
-                        let _ = temp_file.seek(SeekFrom::Start(0));
+            // Copy existing blob content to temp file unless O_TRUNC is set
+            if !truncate {
+                if let Ok(Some(entry)) = self.db.get_entry(&path) {
+                    if let Some(hash) = entry.hash {
+                        if let Ok(data) = self.store.get(&hash) {
+                            let _ = temp_file.write_all(&data);
+                            let _ = temp_file.seek(SeekFrom::Start(0));
+                        }
                     }
                 }
             }

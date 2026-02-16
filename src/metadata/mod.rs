@@ -4,7 +4,7 @@ pub mod types;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use parking_lot::RwLock;
+use parking_lot::Mutex;
 use rusqlite::{Connection, params};
 
 use crate::{BlobHash, NetFuseError, Result};
@@ -12,7 +12,7 @@ use types::{BlobRecord, EntryKind, FileEntry, Timestamp, VectorClock};
 
 /// Thread-safe SQLite-backed metadata database.
 pub struct MetadataDb {
-    conn: RwLock<Connection>,
+    conn: Mutex<Connection>,
     node_id: uuid::Uuid,
 }
 
@@ -23,7 +23,7 @@ impl MetadataDb {
         schema::init_schema(&conn)?;
         schema::ensure_root(&conn, node_id)?;
         Ok(Self {
-            conn: RwLock::new(conn),
+            conn: Mutex::new(conn),
             node_id,
         })
     }
@@ -34,7 +34,7 @@ impl MetadataDb {
         schema::init_schema(&conn)?;
         schema::ensure_root(&conn, node_id)?;
         Ok(Self {
-            conn: RwLock::new(conn),
+            conn: Mutex::new(conn),
             node_id,
         })
     }
@@ -45,7 +45,7 @@ impl MetadataDb {
 
     /// Get a file entry by path.
     pub fn get_entry(&self, path: &str) -> Result<Option<FileEntry>> {
-        let conn = self.conn.read();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
             "SELECT path, parent_path, hash, size, mtime_secs, mtime_nanos,
                     ctime_secs, ctime_nanos, permissions, kind, vclock,
@@ -66,7 +66,7 @@ impl MetadataDb {
 
     /// Insert or update a file entry.
     pub fn upsert_entry(&self, entry: &FileEntry) -> Result<()> {
-        let conn = self.conn.write();
+        let conn = self.conn.lock();
         let vclock_bytes = entry.vclock.serialize();
         let hash_bytes = entry.hash.as_ref().map(|h| h.as_slice());
         let conflict_bytes = entry.conflict_id.map(|id| id.as_bytes().to_vec());
@@ -109,14 +109,14 @@ impl MetadataDb {
 
     /// Delete an entry by path.
     pub fn delete_entry(&self, path: &str) -> Result<()> {
-        let conn = self.conn.write();
+        let conn = self.conn.lock();
         conn.execute("DELETE FROM files WHERE path = ?1", params![path])?;
         Ok(())
     }
 
     /// List direct children of a directory.
     pub fn list_children(&self, parent_path: &str) -> Result<Vec<FileEntry>> {
-        let conn = self.conn.read();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
             "SELECT path, parent_path, hash, size, mtime_secs, mtime_nanos,
                     ctime_secs, ctime_nanos, permissions, kind, vclock,
@@ -133,7 +133,7 @@ impl MetadataDb {
 
     /// Register a blob in the blob tracking table.
     pub fn register_blob(&self, hash: &BlobHash, size: u64, local_path: &str) -> Result<()> {
-        let conn = self.conn.write();
+        let conn = self.conn.lock();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -152,7 +152,7 @@ impl MetadataDb {
 
     /// Update the last_accessed time for a blob.
     pub fn touch_blob(&self, hash: &BlobHash) -> Result<()> {
-        let conn = self.conn.write();
+        let conn = self.conn.lock();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -167,7 +167,7 @@ impl MetadataDb {
 
     /// Decrement the ref_count for a blob.
     pub fn deref_blob(&self, hash: &BlobHash) -> Result<()> {
-        let conn = self.conn.write();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE blobs SET ref_count = MAX(0, ref_count - 1) WHERE hash = ?1",
             params![hash.as_slice()],
@@ -177,7 +177,7 @@ impl MetadataDb {
 
     /// Get a blob record.
     pub fn get_blob(&self, hash: &BlobHash) -> Result<Option<BlobRecord>> {
-        let conn = self.conn.read();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
             "SELECT hash, size, local_path, last_accessed, ref_count FROM blobs WHERE hash = ?1",
         )?;
@@ -204,7 +204,7 @@ impl MetadataDb {
 
     /// Get all file paths in the database.
     pub fn all_paths(&self) -> Result<Vec<String>> {
-        let conn = self.conn.read();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached("SELECT path FROM files ORDER BY path")?;
         let paths = stmt
             .query_map([], |row| row.get(0))?
@@ -214,7 +214,7 @@ impl MetadataDb {
 
     /// Rename: update path and parent_path for an entry (and children if directory).
     pub fn rename_entry(&self, old_path: &str, new_path: &str, new_parent: &str) -> Result<()> {
-        let conn = self.conn.write();
+        let conn = self.conn.lock();
 
         // Check if old entry exists
         let kind: Option<u8> = conn

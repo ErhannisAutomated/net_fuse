@@ -1,3 +1,5 @@
+pub mod keys;
+
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -18,6 +20,10 @@ pub struct CliArgs {
     #[arg(short, long)]
     pub name: Option<String>,
 
+    /// Port to listen on for QUIC connections.
+    #[arg(short, long, default_value = "4433")]
+    pub port: u16,
+
     /// Allow mounting over a non-empty directory.
     #[arg(long, default_value_t = false)]
     pub allow_other: bool,
@@ -29,7 +35,10 @@ pub struct AppConfig {
     pub data_dir: PathBuf,
     pub blobs_dir: PathBuf,
     pub db_path: PathBuf,
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
     pub node_name: String,
+    pub port: u16,
     pub allow_other: bool,
 }
 
@@ -46,6 +55,8 @@ impl AppConfig {
 
         let blobs_dir = data_dir.join("blobs");
         let db_path = data_dir.join("metadata.db");
+        let cert_path = data_dir.join("node_cert.der");
+        let key_path = data_dir.join("node_key.der");
 
         let node_name = args
             .name
@@ -60,7 +71,10 @@ impl AppConfig {
             data_dir,
             blobs_dir,
             db_path,
+            cert_path,
+            key_path,
             node_name,
+            port: args.port,
             allow_other: args.allow_other,
         })
     }

@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -5,12 +6,17 @@ use clap::Parser;
 use fuser::MountOption;
 use tracing::info;
 
+use net_fuse::config::keys::NodeIdentity;
 use net_fuse::config::{AppConfig, CliArgs};
 use net_fuse::fuse_fs::NetFuseFS;
 use net_fuse::metadata::MetadataDb;
+use net_fuse::net::discovery::Discovery;
+use net_fuse::net::peer_manager::PeerManager;
+use net_fuse::net::transport::Transport;
 use net_fuse::store::BlobStore;
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     // Init logging
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -35,10 +41,57 @@ fn main() -> Result<()> {
     let store = Arc::new(BlobStore::new(config.blobs_dir.clone())?);
     info!("Blob store at {:?}", config.blobs_dir);
 
-    // Create FUSE filesystem
+    // --- Phase 2: Networking ---
+
+    // Load or generate TLS identity
+    let identity = NodeIdentity::load_or_generate(
+        &config.cert_path,
+        &config.key_path,
+        &config.node_name,
+    )?;
+    let server_config = identity.build_server_config()?;
+    let client_config = identity.build_client_config()?;
+    info!("TLS identity loaded");
+
+    // Create QUIC transport
+    let bind_addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+    let transport = Arc::new(
+        Transport::new(
+            bind_addr,
+            node_id,
+            config.node_name.clone(),
+            server_config,
+            client_config,
+        )
+        .await?,
+    );
+    info!("QUIC transport listening on {}", transport.local_addr()?);
+
+    // Start accepting incoming connections
+    let (connected_tx, mut connected_rx) = tokio::sync::mpsc::channel(32);
+    tokio::spawn(transport.clone().accept_loop(connected_tx));
+
+    // Log incoming peer connections
+    tokio::spawn(async move {
+        while let Some((peer_id, peer_name)) = connected_rx.recv().await {
+            info!(%peer_id, %peer_name, "Peer connected (incoming)");
+        }
+    });
+
+    // Start mDNS discovery
+    let discovery = Discovery::new(node_id, &config.node_name, config.port)?;
+    let discovered_rx = discovery.browse()?;
+
+    // Start peer manager (handles mDNS discoveries -> outgoing connections)
+    let peer_mgr = PeerManager::new(transport.clone());
+    tokio::spawn(async move {
+        peer_mgr.handle_discoveries(discovered_rx).await;
+    });
+
+    // --- Mount FUSE filesystem ---
+
     let fs = NetFuseFS::new(db, store);
 
-    // Mount options
     let mut options = vec![
         MountOption::FSName("net_fuse".to_string()),
         MountOption::AutoUnmount,
@@ -50,10 +103,17 @@ fn main() -> Result<()> {
 
     info!("Mounting at {:?}", config.mount_point);
 
-    // Mount the filesystem (blocks until unmounted or Ctrl-C)
-    fuser::mount2(fs, &config.mount_point, &options)?;
+    // spawn_mount2 runs FUSE in a background thread, returns a session guard
+    let _session = fuser::spawn_mount2(fs, &config.mount_point, &options)?;
 
-    info!("Unmounted. Goodbye.");
+    // Wait for Ctrl-C
+    tokio::signal::ctrl_c().await?;
+
+    info!("Shutting down...");
+    drop(_session);
+    discovery.shutdown()?;
+
+    info!("Goodbye.");
     Ok(())
 }
 
@@ -77,9 +137,6 @@ fn load_or_create_node_id(config: &AppConfig) -> Result<uuid::Uuid> {
 
     // Generate a new node ID and store it
     let id = uuid::Uuid::new_v4();
-    // The DB will be created by MetadataDb::open, but we need the ID first.
-    // Store it after DB is created — we'll do it via a simple approach:
-    // open db, init schema, store config.
     let conn = rusqlite::Connection::open(db_path)?;
     net_fuse::metadata::schema::init_schema(&conn)?;
     conn.execute(

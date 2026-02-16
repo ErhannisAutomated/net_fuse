@@ -94,7 +94,7 @@ impl EntryKind {
 }
 
 /// Timestamp with second + nanosecond precision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Timestamp {
     pub secs: i64,
     pub nanos: u32,
@@ -121,7 +121,7 @@ impl Timestamp {
 }
 
 /// A file/directory entry in the metadata DB.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
     pub path: String,
     pub parent_path: String,
