@@ -297,6 +297,13 @@ impl Transport {
                     send.finish()?;
                 }
             }
+            Message::BlobHaveQuery { hash } => {
+                let have = store.has(&hash);
+                debug!(%peer_id, hash = %hex::encode(hash), have, "BlobHaveQuery");
+                let resp = Message::BlobHaveResponse { hash, have };
+                protocol::write_message(send, &resp).await?;
+                send.finish()?;
+            }
             other => {
                 warn!(%peer_id, ?other, "Unexpected message on bi-stream");
             }

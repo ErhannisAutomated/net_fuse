@@ -56,6 +56,14 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         ",
     )?;
 
+    // Migration: add `pinned` column to blobs (idempotent).
+    let has_pinned: bool = conn
+        .prepare("SELECT pinned FROM blobs LIMIT 0")
+        .is_ok();
+    if !has_pinned {
+        conn.execute_batch("ALTER TABLE blobs ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;")?;
+    }
+
     Ok(())
 }
 

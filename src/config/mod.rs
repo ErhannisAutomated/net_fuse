@@ -27,6 +27,22 @@ pub struct CliArgs {
     /// Allow mounting over a non-empty directory.
     #[arg(long, default_value_t = false)]
     pub allow_other: bool,
+
+    /// Soft cache size limit in bytes (evict old blobs above this).
+    #[arg(long, default_value_t = 5_368_709_120)]
+    pub cache_soft_limit: u64,
+
+    /// Hard cache size limit in bytes (evict unconditionally above this).
+    #[arg(long, default_value_t = 10_737_418_240)]
+    pub cache_hard_limit: u64,
+
+    /// Maximum blob age in seconds for soft eviction (default 7 days).
+    #[arg(long, default_value_t = 604_800)]
+    pub cache_max_age: u64,
+
+    /// Interval in seconds between eviction cycles (default 5 min).
+    #[arg(long, default_value_t = 300)]
+    pub eviction_interval: u64,
 }
 
 /// Resolved application configuration.
@@ -40,6 +56,10 @@ pub struct AppConfig {
     pub node_name: String,
     pub port: u16,
     pub allow_other: bool,
+    pub cache_soft_limit: u64,
+    pub cache_hard_limit: u64,
+    pub cache_max_age_secs: u64,
+    pub eviction_interval_secs: u64,
 }
 
 impl AppConfig {
@@ -76,6 +96,10 @@ impl AppConfig {
             node_name,
             port: args.port,
             allow_other: args.allow_other,
+            cache_soft_limit: args.cache_soft_limit,
+            cache_hard_limit: args.cache_hard_limit,
+            cache_max_age_secs: args.cache_max_age,
+            eviction_interval_secs: args.eviction_interval,
         })
     }
 

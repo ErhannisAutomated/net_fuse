@@ -6,6 +6,7 @@ use clap::Parser;
 use fuser::MountOption;
 use tracing::info;
 
+use net_fuse::cache::CacheManager;
 use net_fuse::config::keys::NodeIdentity;
 use net_fuse::config::{AppConfig, CliArgs};
 use net_fuse::fuse_fs::NetFuseFS;
@@ -112,6 +113,11 @@ async fn main() -> Result<()> {
         peer_connected_rx,
     );
     tokio::spawn(sync_engine.run());
+
+    // --- Phase 5: Cache Eviction ---
+
+    let cache_mgr = CacheManager::new(db.clone(), store.clone(), transport.clone(), &config);
+    tokio::spawn(cache_mgr.run());
 
     // --- Mount FUSE filesystem ---
 

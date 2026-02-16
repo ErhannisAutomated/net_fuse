@@ -335,6 +335,90 @@ impl MetadataDb {
         Ok(())
     }
 
+    /// Get the total size of all locally stored blobs.
+    pub fn total_blob_size(&self) -> Result<u64> {
+        let conn = self.conn.lock();
+        let size: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(size), 0) FROM blobs",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(size as u64)
+    }
+
+    /// Get eviction candidates: unpinned blobs ordered by last_accessed ASC.
+    /// If `older_than` is Some, only returns blobs with last_accessed < cutoff.
+    pub fn eviction_candidates(&self, older_than: Option<i64>) -> Result<Vec<BlobRecord>> {
+        let conn = self.conn.lock();
+        let records = if let Some(cutoff) = older_than {
+            let mut stmt = conn.prepare_cached(
+                "SELECT hash, size, local_path, last_accessed, ref_count
+                 FROM blobs WHERE pinned = 0 AND last_accessed < ?1
+                 ORDER BY last_accessed ASC",
+            )?;
+            stmt.query_map(params![cutoff], |row| {
+                let hash_bytes: Vec<u8> = row.get(0)?;
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&hash_bytes);
+                Ok(BlobRecord {
+                    hash,
+                    size: row.get::<_, i64>(1)? as u64,
+                    local_path: row.get(2)?,
+                    last_accessed: row.get(3)?,
+                    ref_count: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            let mut stmt = conn.prepare_cached(
+                "SELECT hash, size, local_path, last_accessed, ref_count
+                 FROM blobs WHERE pinned = 0
+                 ORDER BY last_accessed ASC",
+            )?;
+            stmt.query_map([], |row| {
+                let hash_bytes: Vec<u8> = row.get(0)?;
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&hash_bytes);
+                Ok(BlobRecord {
+                    hash,
+                    size: row.get::<_, i64>(1)? as u64,
+                    local_path: row.get(2)?,
+                    last_accessed: row.get(3)?,
+                    ref_count: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        Ok(records)
+    }
+
+    /// Remove a blob record from the tracking table.
+    pub fn remove_blob_record(&self, hash: &BlobHash) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM blobs WHERE hash = ?1", params![hash.as_slice()])?;
+        Ok(())
+    }
+
+    /// Pin a blob so it is never evicted.
+    pub fn pin_blob(&self, hash: &BlobHash) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE blobs SET pinned = 1 WHERE hash = ?1",
+            params![hash.as_slice()],
+        )?;
+        Ok(())
+    }
+
+    /// Unpin a blob so it becomes eligible for eviction.
+    pub fn unpin_blob(&self, hash: &BlobHash) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE blobs SET pinned = 0 WHERE hash = ?1",
+            params![hash.as_slice()],
+        )?;
+        Ok(())
+    }
+
     /// Rename: update path and parent_path for an entry (and children if directory).
     pub fn rename_entry(&self, old_path: &str, new_path: &str, new_parent: &str) -> Result<()> {
         let conn = self.conn.lock();
@@ -560,5 +644,92 @@ mod tests {
         assert!(db.get_entry("/a/f.txt").unwrap().is_none());
         let moved = db.get_entry("/b/f.txt").unwrap().unwrap();
         assert_eq!(moved.parent_path, "/b");
+    }
+
+    #[test]
+    fn test_total_blob_size() {
+        let db = setup();
+        assert_eq!(db.total_blob_size().unwrap(), 0);
+
+        db.register_blob(&[1u8; 32], 100, "/blobs/01/01..").unwrap();
+        db.register_blob(&[2u8; 32], 250, "/blobs/02/02..").unwrap();
+        assert_eq!(db.total_blob_size().unwrap(), 350);
+    }
+
+    #[test]
+    fn test_eviction_candidates_order_and_pinned() {
+        let db = setup();
+        // Register blobs with different access times (via manual touch)
+        db.register_blob(&[1u8; 32], 100, "/blobs/01/01..").unwrap();
+        db.register_blob(&[2u8; 32], 200, "/blobs/02/02..").unwrap();
+        db.register_blob(&[3u8; 32], 300, "/blobs/03/03..").unwrap();
+
+        // Pin blob 2
+        db.pin_blob(&[2u8; 32]).unwrap();
+
+        // All unpinned candidates (no age filter)
+        let candidates = db.eviction_candidates(None).unwrap();
+        assert_eq!(candidates.len(), 2);
+        // Pinned blob 2 should be excluded
+        assert!(candidates.iter().all(|c| c.hash != [2u8; 32]));
+
+        // Unpin and verify it comes back
+        db.unpin_blob(&[2u8; 32]).unwrap();
+        let candidates = db.eviction_candidates(None).unwrap();
+        assert_eq!(candidates.len(), 3);
+    }
+
+    #[test]
+    fn test_eviction_candidates_age_filter() {
+        let db = setup();
+        db.register_blob(&[1u8; 32], 100, "/blobs/01/01..").unwrap();
+
+        // Manually set last_accessed to an old timestamp
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "UPDATE blobs SET last_accessed = 1000 WHERE hash = ?1",
+                params![[1u8; 32].as_slice()],
+            ).unwrap();
+        }
+
+        db.register_blob(&[2u8; 32], 200, "/blobs/02/02..").unwrap();
+
+        // Only blobs older than cutoff=5000
+        let candidates = db.eviction_candidates(Some(5000)).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].hash, [1u8; 32]);
+    }
+
+    #[test]
+    fn test_remove_blob_record() {
+        let db = setup();
+        let hash = [5u8; 32];
+        db.register_blob(&hash, 512, "/blobs/05/05..").unwrap();
+        assert!(db.get_blob(&hash).unwrap().is_some());
+
+        db.remove_blob_record(&hash).unwrap();
+        assert!(db.get_blob(&hash).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_pin_unpin_blob() {
+        let db = setup();
+        let hash = [7u8; 32];
+        db.register_blob(&hash, 64, "/blobs/07/07..").unwrap();
+
+        // Initially unpinned
+        let candidates = db.eviction_candidates(None).unwrap();
+        assert!(candidates.iter().any(|c| c.hash == hash));
+
+        // Pin
+        db.pin_blob(&hash).unwrap();
+        let candidates = db.eviction_candidates(None).unwrap();
+        assert!(!candidates.iter().any(|c| c.hash == hash));
+
+        // Unpin
+        db.unpin_blob(&hash).unwrap();
+        let candidates = db.eviction_candidates(None).unwrap();
+        assert!(candidates.iter().any(|c| c.hash == hash));
     }
 }
