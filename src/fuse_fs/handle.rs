@@ -70,6 +70,18 @@ impl HandleTable {
     pub fn release(&mut self, fh: u64) -> Option<HandleInfo> {
         self.handles.remove(&fh)
     }
+
+    /// Truncate all writable temp files for a given path to `new_size`.
+    /// Used when setattr(size=...) arrives without a file handle.
+    pub fn truncate_by_path(&mut self, path: &str, new_size: u64) {
+        for handle in self.handles.values_mut() {
+            if handle.writable && handle.path == path {
+                if let Some(ref mut f) = handle.temp_file {
+                    let _ = f.set_len(new_size);
+                }
+            }
+        }
+    }
 }
 
 impl HandleInfo {

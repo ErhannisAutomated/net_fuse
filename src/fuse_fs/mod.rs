@@ -291,22 +291,25 @@ impl Filesystem for NetFuseFS {
 
         // Handle truncation
         if let Some(new_size) = size {
-            if new_size == 0 && entry.kind == EntryKind::File {
-                entry.size = 0;
-                entry.hash = None;
-                entry.mtime = Timestamp::now();
-            } else if let Some(fh_val) = fh {
-                // Truncate via temp file
-                let mut handles = self.handles.lock();
+            // Truncate the temp file if there's an open writable handle
+            let mut handles = self.handles.lock();
+            if let Some(fh_val) = fh {
                 if let Some(handle) = handles.get_mut(fh_val) {
                     if let Some(ref mut f) = handle.temp_file {
                         let _ = f.set_len(new_size);
                     }
                 }
-                entry.size = new_size;
             } else {
-                entry.size = new_size;
+                // No fh provided (common with O_TRUNC) — find by path
+                handles.truncate_by_path(&path, new_size);
             }
+            drop(handles);
+
+            entry.size = new_size;
+            if new_size == 0 && entry.kind == EntryKind::File {
+                entry.hash = None;
+            }
+            entry.mtime = Timestamp::now();
         }
 
         entry.vclock.increment(self.db.node_id());
@@ -505,7 +508,48 @@ impl Filesystem for NetFuseFS {
             if !truncate {
                 if let Ok(Some(entry)) = self.db.get_entry(&path) {
                     if let Some(hash) = entry.hash {
-                        if let Ok(data) = self.store.get(&hash) {
+                        let data = match self.store.get(&hash) {
+                            Ok(data) => Some(data),
+                            Err(_) => {
+                                // Blob not local — try fetching from a peer
+                                if let (Some(transport), Some(handle)) =
+                                    (&self.transport, &self.rt_handle)
+                                {
+                                    let origin = entry.origin_node;
+                                    match handle
+                                        .block_on(Self::fetch_from_peers(transport, origin, &hash))
+                                    {
+                                        Ok(data) => {
+                                            // Cache locally
+                                            if let Ok((_, blob_size)) =
+                                                self.store.store_bytes(&data)
+                                            {
+                                                let blob_path = format!(
+                                                    "{}/{}",
+                                                    &hex::encode(hash)[..2],
+                                                    hex::encode(hash)
+                                                );
+                                                let _ = self.db.register_blob(
+                                                    &hash, blob_size, &blob_path,
+                                                );
+                                            }
+                                            Some(data)
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "open: blob not available locally or from peers: {}",
+                                                e
+                                            );
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    warn!("open: blob not found locally: {}", hex::encode(hash));
+                                    None
+                                }
+                            }
+                        };
+                        if let Some(data) = data {
                             let _ = temp_file.write_all(&data);
                             let _ = temp_file.seek(SeekFrom::Start(0));
                         }
