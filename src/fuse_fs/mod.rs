@@ -1040,7 +1040,9 @@ impl Filesystem for NetFuseFS {
             return;
         };
 
-        // If destination exists, remove it first
+        // If destination exists, capture its vclock (so we can dominate it
+        // after rename) and remove it.
+        let mut dest_vclock = None;
         if let Ok(Some(existing)) = self.db.get_entry(&new_path) {
             if existing.kind == EntryKind::Directory {
                 // Check if empty
@@ -1051,6 +1053,7 @@ impl Filesystem for NetFuseFS {
                     }
                 }
             }
+            dest_vclock = Some(existing.vclock.clone());
             if let Some(hash) = existing.hash {
                 let _ = self.db.deref_blob(&hash);
             }
@@ -1064,8 +1067,17 @@ impl Filesystem for NetFuseFS {
             return;
         }
 
-        // Send sync event with the new entry
-        if let Ok(Some(new_entry)) = self.db.get_entry(&new_path) {
+        // Merge the destination's vclock into the renamed entry and increment,
+        // so the renamed entry dominates whatever remote peers have for the
+        // destination path (they may have received earlier updates for it).
+        if let Ok(Some(mut new_entry)) = self.db.get_entry(&new_path) {
+            if let Some(dvc) = dest_vclock {
+                new_entry.vclock.merge(&dvc);
+            }
+            new_entry.vclock.increment(self.db.node_id());
+            if let Err(e) = self.db.upsert_entry(&new_entry) {
+                error!("rename vclock update error: {}", e);
+            }
             self.send_sync(SyncEvent::Renamed {
                 old_path: old_path.clone(),
                 new_entry,
