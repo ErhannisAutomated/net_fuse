@@ -5,7 +5,8 @@ use std::sync::Arc;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::{DigitallySignedStruct, DistinguishedName, Error as TlsError, SignatureScheme};
 
 /// Node TLS identity: certificate + private key stored as raw DER bytes.
 pub struct NodeIdentity {
@@ -49,9 +50,10 @@ impl NodeIdentity {
 
     /// Build a quinn ServerConfig for accepting incoming QUIC connections.
     pub fn build_server_config(&self) -> anyhow::Result<quinn::ServerConfig> {
+        let client_verifier = Arc::new(AcceptAnyClientCert);
         let mut server_crypto = rustls::ServerConfig::builder_with_provider(crypto_provider())
             .with_safe_default_protocol_versions()?
-            .with_no_client_auth()
+            .with_client_cert_verifier(client_verifier)
             .with_single_cert(vec![self.cert()], self.key())?;
         server_crypto.alpn_protocols = vec![b"netfuse/1".to_vec()];
 
@@ -70,7 +72,7 @@ impl NodeIdentity {
             .with_safe_default_protocol_versions()?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-            .with_no_client_auth();
+            .with_client_auth_cert(vec![self.cert()], self.key())?;
         client_crypto.alpn_protocols = vec![b"netfuse/1".to_vec()];
 
         let quic_client_config =
@@ -81,6 +83,50 @@ impl NodeIdentity {
 
 fn crypto_provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
+}
+
+/// Client certificate verifier that accepts any client certificate.
+/// Actual trust is enforced at the application layer via PeerAuth.
+#[derive(Debug)]
+struct AcceptAnyClientCert;
+
+impl ClientCertVerifier for AcceptAnyClientCert {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, TlsError> {
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 /// Certificate verifier that accepts any server certificate.
