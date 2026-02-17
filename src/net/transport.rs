@@ -350,12 +350,16 @@ impl Transport {
 
     /// Send a message to a specific peer (fire-and-forget via unidirectional stream).
     pub async fn send(&self, peer_id: Uuid, msg: &Message) -> anyhow::Result<()> {
-        let connections = self.connections.read().await;
-        let peer = connections
-            .get(&peer_id)
-            .ok_or_else(|| anyhow::anyhow!("not connected to peer {}", peer_id))?;
+        let conn = {
+            let connections = self.connections.read().await;
+            connections
+                .get(&peer_id)
+                .ok_or_else(|| anyhow::anyhow!("not connected to peer {}", peer_id))?
+                .connection
+                .clone()
+        };
 
-        let mut send = peer.connection.open_uni().await?;
+        let mut send = conn.open_uni().await?;
         protocol::write_message(&mut send, msg).await?;
         send.finish()?;
         Ok(())
@@ -363,12 +367,16 @@ impl Transport {
 
     /// Send a message and wait for a response (via bidirectional stream).
     pub async fn request(&self, peer_id: Uuid, msg: &Message) -> anyhow::Result<Message> {
-        let connections = self.connections.read().await;
-        let peer = connections
-            .get(&peer_id)
-            .ok_or_else(|| anyhow::anyhow!("not connected to peer {}", peer_id))?;
+        let conn = {
+            let connections = self.connections.read().await;
+            connections
+                .get(&peer_id)
+                .ok_or_else(|| anyhow::anyhow!("not connected to peer {}", peer_id))?
+                .connection
+                .clone()
+        };
 
-        let (mut send, mut recv) = peer.connection.open_bi().await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
         protocol::write_message(&mut send, msg).await?;
         send.finish()?;
 
@@ -411,13 +419,16 @@ impl Transport {
 
     /// Fetch a blob from a specific peer by opening a bi-directional stream.
     pub async fn fetch_blob(&self, peer_id: Uuid, hash: &BlobHash) -> anyhow::Result<Vec<u8>> {
-        let connections = self.connections.read().await;
-        let peer = connections
-            .get(&peer_id)
-            .ok_or_else(|| anyhow::anyhow!("not connected to peer {}", peer_id))?;
+        let conn = {
+            let connections = self.connections.read().await;
+            connections
+                .get(&peer_id)
+                .ok_or_else(|| anyhow::anyhow!("not connected to peer {}", peer_id))?
+                .connection
+                .clone()
+        };
 
-        let (mut send, mut recv) = peer.connection.open_bi().await?;
-        drop(connections);
+        let (mut send, mut recv) = conn.open_bi().await?;
 
         let req = Message::BlobRequest { hash: *hash };
         protocol::write_message(&mut send, &req).await?;

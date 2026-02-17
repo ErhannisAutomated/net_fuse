@@ -699,10 +699,7 @@ impl Filesystem for NetFuseFS {
                 }
                 None => None,
             };
-            // Only clear dirty if finalization succeeded
-            if result.is_some() {
-                handle.dirty = false;
-            }
+            // Don't clear dirty yet — wait until DB upsert succeeds.
             (path, result)
         };
 
@@ -725,6 +722,13 @@ impl Filesystem for NetFuseFS {
                         error!("flush upsert error: {}", e);
                         reply.error(libc::EIO);
                         return;
+                    }
+                    // DB upsert succeeded — now safe to clear dirty.
+                    {
+                        let mut handles = self.handles.lock();
+                        if let Some(handle) = handles.get_mut(fh) {
+                            handle.dirty = false;
+                        }
                     }
                     info!(
                         path = %path,

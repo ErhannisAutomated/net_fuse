@@ -88,6 +88,7 @@ impl HandleTable {
                     let _ = f.set_len(new_size);
                 }
                 handle.current_size = new_size;
+                handle.dirty = true;
             }
         }
     }
