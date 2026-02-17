@@ -99,7 +99,13 @@ impl SyncEngine {
     async fn handle_local_event(&self, event: SyncEvent) {
         let msg = match event {
             SyncEvent::FileUpdated(entry) | SyncEvent::DirCreated(entry) => {
-                debug!(path = %entry.path, "Broadcasting PathUpdate");
+                info!(
+                    path = %entry.path,
+                    hash = %entry.hash.map(|h| hex::encode(h)).unwrap_or_default(),
+                    size = entry.size,
+                    kind = ?entry.kind,
+                    "Broadcasting PathUpdate"
+                );
                 Message::PathUpdate(entry)
             }
             SyncEvent::FileDeleted {
@@ -112,7 +118,7 @@ impl SyncEngine {
                 vclock,
                 origin_node,
             } => {
-                debug!(%path, "Broadcasting PathDelete");
+                info!(%path, "Broadcasting PathDelete");
                 Message::PathDelete {
                     path,
                     vclock,
@@ -129,10 +135,15 @@ impl SyncEngine {
                     vclock: new_entry.vclock.clone(),
                     origin_node: new_entry.origin_node,
                 };
-                debug!(%old_path, "Broadcasting PathDelete (rename old)");
+                info!(%old_path, "Broadcasting PathDelete (rename old)");
                 self.transport.broadcast(&delete_msg).await;
 
-                debug!(path = %new_entry.path, "Broadcasting PathUpdate (rename new)");
+                info!(
+                    path = %new_entry.path,
+                    hash = %new_entry.hash.map(|h| hex::encode(h)).unwrap_or_default(),
+                    size = new_entry.size,
+                    "Broadcasting PathUpdate (rename new)"
+                );
                 Message::PathUpdate(new_entry)
             }
         };
@@ -169,15 +180,28 @@ impl SyncEngine {
     /// Apply a remote PathUpdate and re-broadcast if it was applied (flood-fill).
     async fn handle_path_update(&self, peer_id: Uuid, entry: FileEntry) {
         let path = entry.path.clone();
+        let hash_str = entry.hash.map(|h| hex::encode(h)).unwrap_or_default();
+        let size = entry.size;
         match self.db.apply_remote_update(&entry) {
             Ok(ApplyResult::Applied) => {
-                info!(%peer_id, %path, "Applied remote update");
+                info!(
+                    %peer_id, %path,
+                    hash = %hash_str,
+                    size = size,
+                    kind = ?entry.kind,
+                    "Applied remote update"
+                );
                 // Flood-fill: re-broadcast to other peers
                 self.broadcast_except(peer_id, &Message::PathUpdate(entry))
                     .await;
             }
             Ok(ApplyResult::Ignored) => {
-                debug!(%peer_id, %path, "Ignored remote update (local is newer)");
+                debug!(
+                    %peer_id, %path,
+                    hash = %hash_str,
+                    size = size,
+                    "Ignored remote update (local is newer)"
+                );
             }
             Ok(ApplyResult::Conflict) => {
                 warn!(%peer_id, %path, "Conflict detected, both versions preserved");
@@ -199,7 +223,7 @@ impl SyncEngine {
     ) {
         match self.db.apply_remote_delete(&path, &vclock) {
             Ok(ApplyResult::Applied) => {
-                info!(%peer_id, %path, "Applied remote delete");
+                info!(%peer_id, %path, "Applied remote delete (file removed)");
                 // Flood-fill
                 let msg = Message::PathDelete {
                     path,

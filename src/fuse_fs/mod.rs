@@ -11,7 +11,7 @@ use fuser::{
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
 use parking_lot::Mutex;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::metadata::types::{EntryKind, FileEntry, Timestamp, VectorClock};
 use crate::metadata::MetadataDb;
@@ -710,9 +710,11 @@ impl Filesystem for NetFuseFS {
         if let Some((hash, size)) = hash_and_size {
             match self.db.get_entry(&path) {
                 Ok(Some(mut entry)) => {
-                    if let Some(old_hash) = entry.hash {
-                        if old_hash != hash {
-                            let _ = self.db.deref_blob(&old_hash);
+                    let old_hash = entry.hash;
+                    let old_size = entry.size;
+                    if let Some(oh) = old_hash {
+                        if oh != hash {
+                            let _ = self.db.deref_blob(&oh);
                         }
                     }
                     entry.hash = Some(hash);
@@ -724,6 +726,14 @@ impl Filesystem for NetFuseFS {
                         reply.error(libc::EIO);
                         return;
                     }
+                    info!(
+                        path = %path,
+                        old_hash = %old_hash.map(|h| hex::encode(h)).unwrap_or_default(),
+                        old_size = old_size,
+                        new_hash = %hex::encode(hash),
+                        new_size = size,
+                        "Local file changed (flush)"
+                    );
                     self.send_sync(SyncEvent::FileUpdated(entry));
                     let blob_path =
                         format!("{}/{}", &hex::encode(&hash)[..2], hex::encode(&hash));
