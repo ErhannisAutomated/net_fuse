@@ -85,7 +85,12 @@ impl BlobStore {
     /// Create a new temp file for writing, returning (path, file).
     pub fn create_temp(&self) -> Result<(PathBuf, File)> {
         let path = self.temp_dir.join(uuid::Uuid::new_v4().to_string());
-        let file = File::create(&path)?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)?;
         Ok((path, file))
     }
 

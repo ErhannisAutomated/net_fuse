@@ -2,7 +2,7 @@ pub mod handle;
 pub mod inode;
 
 use std::ffi::OsStr;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -176,6 +176,51 @@ impl NetFuseFS {
         anyhow::bail!("no peer has blob {}", hex::encode(hash))
     }
 
+    /// Snapshot any active writer's temp file for `path` into the blob store
+    /// and update the DB entry. Called when a second fd opens the file for reading
+    /// while a writer is still active, ensuring the read fd sees committed data.
+    fn snapshot_writer(&self, path: &str) {
+        let content = {
+            let mut handles = self.handles.lock();
+            let mut found = None;
+            for handle in handles.handles_iter_mut() {
+                if handle.writable && handle.path == path && handle.dirty {
+                    if let Some(ref mut f) = handle.temp_file {
+                        let _ = f.flush();
+                        if f.seek(SeekFrom::Start(0)).is_ok() {
+                            let mut buf = Vec::new();
+                            if f.read_to_end(&mut buf).is_ok() {
+                                handle.dirty = false;
+                                found = Some(buf);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            found
+        };
+
+        let Some(content) = content else { return };
+        let Ok((hash, size)) = self.store.store_bytes(&content) else { return };
+
+        if let Ok(Some(mut entry)) = self.db.get_entry(path) {
+            if let Some(old_hash) = entry.hash {
+                if old_hash != hash {
+                    let _ = self.db.deref_blob(&old_hash);
+                }
+            }
+            entry.hash = Some(hash);
+            entry.size = size;
+            entry.mtime = Timestamp::now();
+            entry.vclock.increment(self.db.node_id());
+            let _ = self.db.upsert_entry(&entry);
+            self.send_sync(SyncEvent::FileUpdated(entry));
+            let blob_path = format!("{}/{}", &hex::encode(&hash)[..2], hex::encode(&hash));
+            let _ = self.db.register_blob(&hash, size, &blob_path);
+        }
+    }
+
     /// Get the parent path of a given path.
     fn parent_of(path: &str) -> &str {
         if path == "/" {
@@ -230,7 +275,13 @@ impl Filesystem for NetFuseFS {
 
         match self.db.get_entry(&path) {
             Ok(Some(entry)) => {
-                let attr = self.entry_to_attr(&entry, ino);
+                let mut attr = self.entry_to_attr(&entry, ino);
+                // If there's an active writable handle, report the temp file size
+                // so the kernel doesn't truncate its page cache.
+                if let Some(ws) = self.handles.lock().writable_size(&path) {
+                    attr.size = ws.max(attr.size);
+                    attr.blocks = (attr.size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
+                }
                 reply.attr(&TTL, &attr);
             }
             Ok(None) => reply.error(libc::ENOENT),
@@ -298,6 +349,7 @@ impl Filesystem for NetFuseFS {
                     if let Some(ref mut f) = handle.temp_file {
                         let _ = f.set_len(new_size);
                     }
+                    handle.current_size = new_size;
                 }
             } else {
                 // No fh provided (common with O_TRUNC) — find by path
@@ -557,9 +609,24 @@ impl Filesystem for NetFuseFS {
                 }
             }
 
-            let fh = self.handles.lock().open_write(path, temp_path, temp_file);
+            let mut handles = self.handles.lock();
+            let fh = handles.open_write(path.clone(), temp_path, temp_file);
+            // Set initial size from the DB entry (for pre-populated content)
+            if let Ok(Some(entry)) = self.db.get_entry(&path) {
+                if let Some(handle) = handles.get_mut(fh) {
+                    handle.current_size = entry.size;
+                    // Not dirty if we only pre-populated existing content
+                    if !truncate {
+                        handle.dirty = false;
+                    }
+                }
+            }
+            drop(handles);
             reply.opened(fh, 0);
         } else {
+            // If there's an active writer for this path, snapshot its data
+            // to the blob store so the reader sees committed content.
+            self.snapshot_writer(&path);
             let fh = self.handles.lock().open_read(path);
             reply.opened(fh, 0);
         }
@@ -593,12 +660,86 @@ impl Filesystem for NetFuseFS {
     }
 
     fn flush(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, _lock: u64, reply: ReplyEmpty) {
-        let mut handles = self.handles.lock();
-        if let Some(handle) = handles.get_mut(fh) {
-            if let Some(ref mut f) = handle.temp_file {
-                let _ = f.flush();
+        // Snapshot the temp file into the blob store so data is visible
+        // to other processes immediately after close() returns.
+        // (FUSE release is async — the kernel doesn't wait for it.)
+        let (path, hash_and_size) = {
+            let mut handles = self.handles.lock();
+            let Some(handle) = handles.get_mut(fh) else {
+                reply.ok();
+                return;
+            };
+            if !handle.writable || !handle.dirty {
+                reply.ok();
+                return;
+            }
+            let path = handle.path.clone();
+            let result = match handle.temp_file {
+                Some(ref mut f) => {
+                    let _ = f.flush();
+                    if let Err(e) = f.seek(SeekFrom::Start(0)) {
+                        error!("flush seek error: {}", e);
+                        None
+                    } else {
+                        let mut content = Vec::new();
+                        match f.read_to_end(&mut content) {
+                            Ok(_) => match self.store.store_bytes(&content) {
+                                Ok(hs) => Some(hs),
+                                Err(e) => {
+                                    error!("flush store error: {}", e);
+                                    None
+                                }
+                            },
+                            Err(e) => {
+                                error!("flush read error: {}", e);
+                                None
+                            }
+                        }
+                    }
+                }
+                None => None,
+            };
+            // Only clear dirty if finalization succeeded
+            if result.is_some() {
+                handle.dirty = false;
+            }
+            (path, result)
+        };
+
+        // Update the DB entry with the new blob
+        if let Some((hash, size)) = hash_and_size {
+            match self.db.get_entry(&path) {
+                Ok(Some(mut entry)) => {
+                    if let Some(old_hash) = entry.hash {
+                        if old_hash != hash {
+                            let _ = self.db.deref_blob(&old_hash);
+                        }
+                    }
+                    entry.hash = Some(hash);
+                    entry.size = size;
+                    entry.mtime = Timestamp::now();
+                    entry.vclock.increment(self.db.node_id());
+                    if let Err(e) = self.db.upsert_entry(&entry) {
+                        error!("flush upsert error: {}", e);
+                        reply.error(libc::EIO);
+                        return;
+                    }
+                    self.send_sync(SyncEvent::FileUpdated(entry));
+                    let blob_path =
+                        format!("{}/{}", &hex::encode(&hash)[..2], hex::encode(&hash));
+                    let _ = self.db.register_blob(&hash, size, &blob_path);
+                }
+                Ok(None) => {
+                    warn!("flush: entry not found for path {}", path);
+                }
+                Err(e) => {
+                    error!("flush get_entry error: {}", e);
+                    reply.error(libc::EIO);
+                    return;
+                }
             }
         }
+
         reply.ok();
     }
 
@@ -623,60 +764,60 @@ impl Filesystem for NetFuseFS {
             return;
         }
 
-        // Finalize the temp file: hash it, store the blob, update the entry
         let Some(temp_path) = handle_info.temp_path else {
             reply.ok();
             return;
         };
-        // Drop the file handle before finalization
-        drop(handle_info.temp_file);
 
-        let (hash, size) = match self.store.finalize_temp(&temp_path) {
-            Ok(hs) => hs,
-            Err(e) => {
-                error!("release finalize error: {}", e);
-                reply.error(libc::EIO);
-                return;
-            }
-        };
+        // If dirty (flush didn't run or more writes happened after flush),
+        // finalize now as a safety net.
+        if handle_info.dirty {
+            drop(handle_info.temp_file);
 
-        let path = handle_info.path;
-
-        // Update the DB entry
-        match self.db.get_entry(&path) {
-            Ok(Some(mut entry)) => {
-                // Deref old blob if different
-                if let Some(old_hash) = entry.hash {
-                    if old_hash != hash {
-                        let _ = self.db.deref_blob(&old_hash);
-                    }
-                }
-
-                entry.hash = Some(hash);
-                entry.size = size;
-                entry.mtime = Timestamp::now();
-                entry.vclock.increment(self.db.node_id());
-
-                if let Err(e) = self.db.upsert_entry(&entry) {
-                    error!("release upsert error: {}", e);
+            let (hash, size) = match self.store.finalize_temp(&temp_path) {
+                Ok(hs) => hs,
+                Err(e) => {
+                    error!("release finalize error: {}", e);
                     reply.error(libc::EIO);
                     return;
                 }
+            };
 
-                self.send_sync(SyncEvent::FileUpdated(entry.clone()));
-
-                // Register the blob
-                let blob_path = format!("{}/{}", &hex::encode(&hash)[..2], hex::encode(&hash));
-                let _ = self.db.register_blob(&hash, size, &blob_path);
+            let path = handle_info.path;
+            match self.db.get_entry(&path) {
+                Ok(Some(mut entry)) => {
+                    if let Some(old_hash) = entry.hash {
+                        if old_hash != hash {
+                            let _ = self.db.deref_blob(&old_hash);
+                        }
+                    }
+                    entry.hash = Some(hash);
+                    entry.size = size;
+                    entry.mtime = Timestamp::now();
+                    entry.vclock.increment(self.db.node_id());
+                    if let Err(e) = self.db.upsert_entry(&entry) {
+                        error!("release upsert error: {}", e);
+                        reply.error(libc::EIO);
+                        return;
+                    }
+                    self.send_sync(SyncEvent::FileUpdated(entry.clone()));
+                    let blob_path =
+                        format!("{}/{}", &hex::encode(&hash)[..2], hex::encode(&hash));
+                    let _ = self.db.register_blob(&hash, size, &blob_path);
+                }
+                Ok(None) => {
+                    warn!("release: entry not found for path {}", path);
+                }
+                Err(e) => {
+                    error!("release get_entry error: {}", e);
+                    reply.error(libc::EIO);
+                    return;
+                }
             }
-            Ok(None) => {
-                warn!("release: entry not found for path {}", path);
-            }
-            Err(e) => {
-                error!("release get_entry error: {}", e);
-                reply.error(libc::EIO);
-                return;
-            }
+        } else {
+            // flush already finalized — just clean up the temp file
+            drop(handle_info.temp_file);
+            let _ = std::fs::remove_file(&temp_path);
         }
 
         reply.ok();

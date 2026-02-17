@@ -14,6 +14,10 @@ pub struct HandleInfo {
     pub temp_path: Option<PathBuf>,
     pub temp_file: Option<File>,
     pub writable: bool,
+    /// True if data has been written since the last flush/finalization.
+    pub dirty: bool,
+    /// Current file size (tracks max offset + bytes_written for writable handles).
+    pub current_size: u64,
 }
 
 impl HandleTable {
@@ -35,6 +39,8 @@ impl HandleTable {
                 temp_path: None,
                 temp_file: None,
                 writable: false,
+                dirty: false,
+                current_size: 0,
             },
         );
         fh
@@ -51,6 +57,8 @@ impl HandleTable {
                 temp_path: Some(temp_path),
                 temp_file: Some(temp_file),
                 writable: true,
+                dirty: true,
+                current_size: 0,
             },
         );
         fh
@@ -79,8 +87,27 @@ impl HandleTable {
                 if let Some(ref mut f) = handle.temp_file {
                     let _ = f.set_len(new_size);
                 }
+                handle.current_size = new_size;
             }
         }
+    }
+
+    /// Iterate over all handles mutably.
+    pub fn handles_iter_mut(&mut self) -> impl Iterator<Item = &mut HandleInfo> {
+        self.handles.values_mut()
+    }
+
+    /// Get the current writable size for a path (if any handle is writing to it).
+    /// Returns the maximum current_size across all writable handles for this path.
+    pub fn writable_size(&self, path: &str) -> Option<u64> {
+        let mut max_size: Option<u64> = None;
+        for handle in self.handles.values() {
+            if handle.writable && handle.path == path {
+                let s = handle.current_size;
+                max_size = Some(max_size.map_or(s, |m: u64| m.max(s)));
+            }
+        }
+        max_size
     }
 }
 
@@ -89,7 +116,13 @@ impl HandleInfo {
     pub fn write_at(&mut self, offset: i64, data: &[u8]) -> std::io::Result<usize> {
         if let Some(ref mut file) = self.temp_file {
             file.seek(SeekFrom::Start(offset as u64))?;
-            file.write(data)
+            let n = file.write(data)?;
+            self.dirty = true;
+            let end = offset as u64 + n as u64;
+            if end > self.current_size {
+                self.current_size = end;
+            }
+            Ok(n)
         } else {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
