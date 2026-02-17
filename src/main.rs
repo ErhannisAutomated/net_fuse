@@ -192,8 +192,10 @@ async fn peer_auth_ui_task(
                     Some(p) => {
                         // Only add if not already decided
                         if !pending.contains_key(&p.fingerprint) {
+                            let our_fp = peer_auth.our_fingerprint();
                             println!("\n--- New peer awaiting authorization ---");
-                            println!("  Peer {:?} fingerprint: SHA256:{}", p.name, &p.fingerprint[..16]);
+                            println!("  Our fingerprint:  SHA256:{}", &our_fp[..16]);
+                            println!("  Peer fingerprint: SHA256:{}", &p.fingerprint[..16]);
                             println!("  (w)hitelist | (s)ession-allow | (i)gnore-session | (b)lacklist");
                             print!("> ");
                             pending.insert(p.fingerprint.clone(), p);
@@ -208,9 +210,11 @@ async fn peer_auth_ui_task(
                 pending.retain(|fp, _| peer_auth.check(fp) == net_fuse::net::peer_auth::AuthResult::Pending);
 
                 if !pending.is_empty() {
+                    let our_fp = peer_auth.our_fingerprint();
                     println!("\n--- Pending peer authorization ({} peer(s)) ---", pending.len());
+                    println!("  Our fingerprint:  SHA256:{}", &our_fp[..16]);
                     for p in pending.values() {
-                        println!("  Peer {:?} fingerprint: SHA256:{}", p.name, &p.fingerprint[..16]);
+                        println!("  Peer fingerprint: SHA256:{}", &p.fingerprint[..16]);
                     }
                     println!("  (w)hitelist | (s)ession-allow | (i)gnore-session | (b)lacklist");
                     if pending.len() > 1 {

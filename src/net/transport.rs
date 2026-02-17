@@ -91,25 +91,31 @@ impl Transport {
         Ok(crate::cert_fingerprint(cert.as_ref()))
     }
 
-    /// Check peer authorization. Returns Ok(fingerprint) if allowed, Err if denied/pending.
+    /// Check peer authorization by fingerprint. Returns Ok(()) if allowed, Err if denied/pending.
+    /// The peer cert is available immediately after QUIC/TLS handshake, before Hello.
     fn check_peer_auth(
         &self,
         connection: &Connection,
-        peer_name: &str,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<()> {
         let fingerprint = Self::peer_fingerprint(connection)?;
+
+        // Self-connections are allowed through auth (caught later by Hello node_id check)
+        if fingerprint == self.peer_auth.our_fingerprint() {
+            return Ok(());
+        }
+
         match self.peer_auth.check(&fingerprint) {
             AuthResult::Allowed => {
                 info!(
                     fingerprint = &fingerprint[..16],
-                    peer_name, "Peer authorized"
+                    "Peer authorized"
                 );
-                Ok(fingerprint)
+                Ok(())
             }
             AuthResult::Denied => {
                 info!(
                     fingerprint = &fingerprint[..16],
-                    peer_name, "Peer denied by auth policy"
+                    "Peer denied by auth policy"
                 );
                 connection.close(0u32.into(), b"denied");
                 anyhow::bail!("peer denied: {}", &fingerprint[..16])
@@ -117,10 +123,10 @@ impl Transport {
             AuthResult::Pending => {
                 info!(
                     fingerprint = &fingerprint[..16],
-                    peer_name, "Peer pending authorization"
+                    "Peer pending authorization"
                 );
                 self.peer_auth
-                    .submit_pending(fingerprint.clone(), peer_name.to_string());
+                    .submit_pending(fingerprint.clone(), "unknown".to_string());
                 connection.close(0u32.into(), b"pending-auth");
                 anyhow::bail!("peer pending auth: {}", &fingerprint[..16])
             }
@@ -141,6 +147,11 @@ impl Transport {
         connection: Connection,
         addr: SocketAddr,
     ) -> anyhow::Result<(Uuid, String)> {
+        // Check peer authorization BEFORE Hello exchange.
+        // Cert is available immediately after QUIC/TLS handshake.
+        // This ensures both sides prompt simultaneously for unknown peers.
+        self.check_peer_auth(&connection)?;
+
         let (mut send, mut recv) = connection.open_bi().await?;
 
         // Send our Hello
@@ -177,12 +188,8 @@ impl Transport {
             anyhow::bail!("connected to self, closing");
         }
 
-        // Check peer authorization
-        self.check_peer_auth(&connection, &peer_name)?;
-
         // Start listening for incoming messages on this connection
-        let conn_clone = connection.clone();
-        self.spawn_stream_listener(peer_id, conn_clone);
+        self.spawn_stream_listener(peer_id, connection.clone());
 
         self.connections.write().await.insert(
             peer_id,
@@ -205,6 +212,9 @@ impl Transport {
         connection: Connection,
         addr: SocketAddr,
     ) -> anyhow::Result<(Uuid, String)> {
+        // Check peer authorization BEFORE Hello exchange.
+        self.check_peer_auth(&connection)?;
+
         let (mut send, mut recv) = connection.accept_bi().await?;
 
         // Read their Hello
@@ -242,12 +252,8 @@ impl Transport {
             anyhow::bail!("incoming connection from self, closing");
         }
 
-        // Check peer authorization
-        self.check_peer_auth(&connection, &peer_name)?;
-
         // Start listening for incoming messages on this connection
-        let conn_clone = connection.clone();
-        self.spawn_stream_listener(peer_id, conn_clone);
+        self.spawn_stream_listener(peer_id, connection.clone());
 
         self.connections.write().await.insert(
             peer_id,
@@ -267,7 +273,10 @@ impl Transport {
     /// Spawn background tasks that listen for incoming streams on a connection.
     /// - Unidirectional streams carry sync messages forwarded to SyncEngine.
     /// - Bidirectional streams carry blob requests served from the local BlobStore.
+    /// When the connection closes, the peer is removed from the connections map.
     fn spawn_stream_listener(&self, peer_id: Uuid, connection: Connection) {
+        let connections = self.connections.clone();
+
         // Uni-directional: sync messages
         let incoming_tx = self.incoming_tx.clone();
         let conn_uni = connection.clone();
@@ -300,10 +309,13 @@ impl Transport {
                     }
                 }
             }
+            // Clean up dead connection so PeerManager can reconnect
+            connections.write().await.remove(&peer_id);
         });
 
         // Bi-directional: blob requests
         let blob_store = self.blob_store.clone();
+        let connections = self.connections.clone();
         tokio::spawn(async move {
             loop {
                 match connection.accept_bi().await {
@@ -327,6 +339,8 @@ impl Transport {
                     }
                 }
             }
+            // Clean up dead connection so PeerManager can reconnect
+            connections.write().await.remove(&peer_id);
         });
     }
 
