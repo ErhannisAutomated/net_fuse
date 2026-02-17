@@ -11,6 +11,11 @@ use sha2::{Digest, Sha256};
 /// A SHA-256 hash used to identify blobs.
 pub type BlobHash = [u8; 32];
 
+/// Compute the SHA-256 fingerprint of a DER-encoded certificate, returned as hex.
+pub fn cert_fingerprint(der: &[u8]) -> String {
+    hex::encode(sha256(der))
+}
+
 /// Compute the SHA-256 hash of a byte slice.
 pub fn sha256(data: &[u8]) -> BlobHash {
     let mut hasher = Sha256::new();

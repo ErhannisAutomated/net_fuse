@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::store::BlobStore;
 use crate::BlobHash;
 
+use super::peer_auth::{AuthResult, PeerAuth};
 use super::protocol::{self, Message, PROTOCOL_VERSION};
 
 /// A connected peer.
@@ -32,6 +33,8 @@ pub struct Transport {
     peer_connected_tx: mpsc::Sender<Uuid>,
     /// Blob store for serving blob requests from peers.
     blob_store: Arc<BlobStore>,
+    /// Peer authorization manager.
+    peer_auth: Arc<PeerAuth>,
 }
 
 impl Transport {
@@ -45,6 +48,7 @@ impl Transport {
         incoming_tx: mpsc::Sender<(Uuid, Message)>,
         peer_connected_tx: mpsc::Sender<Uuid>,
         blob_store: Arc<BlobStore>,
+        peer_auth: Arc<PeerAuth>,
     ) -> anyhow::Result<Self> {
         // Configure keepalive to prevent idle timeout
         let mut server_transport = quinn::TransportConfig::default();
@@ -69,7 +73,58 @@ impl Transport {
             incoming_tx,
             peer_connected_tx,
             blob_store,
+            peer_auth,
         })
+    }
+
+    /// Extract the peer's certificate fingerprint from a QUIC connection.
+    fn peer_fingerprint(connection: &Connection) -> anyhow::Result<String> {
+        let identity = connection
+            .peer_identity()
+            .ok_or_else(|| anyhow::anyhow!("no peer identity available"))?;
+        let certs: &Vec<rustls::pki_types::CertificateDer<'_>> = identity
+            .downcast_ref()
+            .ok_or_else(|| anyhow::anyhow!("unexpected peer identity type"))?;
+        let cert = certs
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("peer presented no certificates"))?;
+        Ok(crate::cert_fingerprint(cert.as_ref()))
+    }
+
+    /// Check peer authorization. Returns Ok(fingerprint) if allowed, Err if denied/pending.
+    fn check_peer_auth(
+        &self,
+        connection: &Connection,
+        peer_name: &str,
+    ) -> anyhow::Result<String> {
+        let fingerprint = Self::peer_fingerprint(connection)?;
+        match self.peer_auth.check(&fingerprint) {
+            AuthResult::Allowed => {
+                info!(
+                    fingerprint = &fingerprint[..16],
+                    peer_name, "Peer authorized"
+                );
+                Ok(fingerprint)
+            }
+            AuthResult::Denied => {
+                info!(
+                    fingerprint = &fingerprint[..16],
+                    peer_name, "Peer denied by auth policy"
+                );
+                connection.close(0u32.into(), b"denied");
+                anyhow::bail!("peer denied: {}", &fingerprint[..16])
+            }
+            AuthResult::Pending => {
+                info!(
+                    fingerprint = &fingerprint[..16],
+                    peer_name, "Peer pending authorization"
+                );
+                self.peer_auth
+                    .submit_pending(fingerprint.clone(), peer_name.to_string());
+                connection.close(0u32.into(), b"pending-auth");
+                anyhow::bail!("peer pending auth: {}", &fingerprint[..16])
+            }
+        }
     }
 
     /// Connect to a peer by address. Performs QUIC handshake, then exchanges
@@ -121,6 +176,9 @@ impl Transport {
             connection.close(0u32.into(), b"self-connection");
             anyhow::bail!("connected to self, closing");
         }
+
+        // Check peer authorization
+        self.check_peer_auth(&connection, &peer_name)?;
 
         // Start listening for incoming messages on this connection
         let conn_clone = connection.clone();
@@ -183,6 +241,9 @@ impl Transport {
             connection.close(0u32.into(), b"self-connection");
             anyhow::bail!("incoming connection from self, closing");
         }
+
+        // Check peer authorization
+        self.check_peer_auth(&connection, &peer_name)?;
 
         // Start listening for incoming messages on this connection
         let conn_clone = connection.clone();

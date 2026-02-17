@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -12,6 +13,7 @@ use net_fuse::config::{AppConfig, CliArgs};
 use net_fuse::fuse_fs::NetFuseFS;
 use net_fuse::metadata::MetadataDb;
 use net_fuse::net::discovery::Discovery;
+use net_fuse::net::peer_auth::{AuthDecision, PeerAuth, PendingPeer};
 use net_fuse::net::peer_manager::PeerManager;
 use net_fuse::net::transport::Transport;
 use net_fuse::store::BlobStore;
@@ -55,6 +57,17 @@ async fn main() -> Result<()> {
     let client_config = identity.build_client_config()?;
     info!("TLS identity loaded");
 
+    // Compute our certificate fingerprint and set up peer authorization
+    let our_fingerprint = net_fuse::cert_fingerprint(&identity.cert_der);
+    println!("Our fingerprint: SHA256:{our_fingerprint}");
+
+    let (pending_tx, pending_rx) = tokio::sync::mpsc::unbounded_channel();
+    let peer_auth = Arc::new(PeerAuth::new(
+        config.data_dir.join("peer_auth.json"),
+        our_fingerprint,
+        pending_tx,
+    ));
+
     // Create channels for Transport -> SyncEngine communication
     let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel(256);
     let (peer_connected_tx, peer_connected_rx) = tokio::sync::mpsc::channel(32);
@@ -71,6 +84,7 @@ async fn main() -> Result<()> {
             incoming_tx,
             peer_connected_tx,
             store.clone(),
+            peer_auth.clone(),
         )
         .await?,
     );
@@ -98,6 +112,12 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         peer_mgr.handle_discoveries(discovered_rx).await;
     });
+
+    // --- Peer authorization UI tasks ---
+
+    // Spawn stdin reader + prompt task for pending peer authorization
+    let peer_auth_ui = peer_auth.clone();
+    tokio::spawn(peer_auth_ui_task(pending_rx, peer_auth_ui));
 
     // --- Phase 3: Sync Engine ---
 
@@ -148,6 +168,117 @@ async fn main() -> Result<()> {
 
     info!("Goodbye.");
     Ok(())
+}
+
+/// Background task that collects pending peers and prompts the user for decisions via stdin.
+async fn peer_auth_ui_task(
+    mut pending_rx: tokio::sync::mpsc::UnboundedReceiver<PendingPeer>,
+    peer_auth: Arc<PeerAuth>,
+) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let mut pending: HashMap<String, PendingPeer> = HashMap::new();
+    let stdin = BufReader::new(tokio::io::stdin());
+    let mut lines = stdin.lines();
+
+    let mut prompt_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+    prompt_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            // Collect newly pending peers
+            peer = pending_rx.recv() => {
+                match peer {
+                    Some(p) => {
+                        // Only add if not already decided
+                        if !pending.contains_key(&p.fingerprint) {
+                            println!("\n--- New peer awaiting authorization ---");
+                            println!("  Peer {:?} fingerprint: SHA256:{}", p.name, &p.fingerprint[..16]);
+                            println!("  (w)hitelist | (s)ession-allow | (i)gnore-session | (b)lacklist");
+                            print!("> ");
+                            pending.insert(p.fingerprint.clone(), p);
+                        }
+                    }
+                    None => break, // channel closed
+                }
+            }
+            // Periodic prompt for any still-pending peers
+            _ = prompt_interval.tick() => {
+                // Remove peers that have been decided since they were added
+                pending.retain(|fp, _| peer_auth.check(fp) == net_fuse::net::peer_auth::AuthResult::Pending);
+
+                if !pending.is_empty() {
+                    println!("\n--- Pending peer authorization ({} peer(s)) ---", pending.len());
+                    for p in pending.values() {
+                        println!("  Peer {:?} fingerprint: SHA256:{}", p.name, &p.fingerprint[..16]);
+                    }
+                    println!("  (w)hitelist | (s)ession-allow | (i)gnore-session | (b)lacklist");
+                    if pending.len() > 1 {
+                        println!("  Prefix with fingerprint, e.g.: w a1b2");
+                    }
+                    print!("> ");
+                }
+            }
+            // Read user input
+            line = lines.next_line() => {
+                match line {
+                    Ok(Some(input)) => {
+                        let input = input.trim().to_string();
+                        if input.is_empty() {
+                            continue;
+                        }
+
+                        let (cmd, prefix) = if input.len() > 1 {
+                            let cmd = &input[..1];
+                            let prefix = input[1..].trim().to_string();
+                            (cmd.to_string(), if prefix.is_empty() { None } else { Some(prefix) })
+                        } else {
+                            (input.clone(), None)
+                        };
+
+                        let decision = match cmd.as_str() {
+                            "w" => Some(AuthDecision::Whitelist),
+                            "s" => Some(AuthDecision::SessionAllow),
+                            "i" => Some(AuthDecision::SessionIgnore),
+                            "b" => Some(AuthDecision::Blacklist),
+                            _ => {
+                                println!("Unknown command '{}'. Use w/s/i/b.", cmd);
+                                None
+                            }
+                        };
+
+                        if let Some(decision) = decision {
+                            // Find the target peer
+                            let target = if pending.len() == 1 && prefix.is_none() {
+                                pending.keys().next().cloned()
+                            } else if let Some(ref pfx) = prefix {
+                                pending.keys().find(|fp| fp.starts_with(pfx.as_str())).cloned()
+                            } else if pending.len() == 1 {
+                                pending.keys().next().cloned()
+                            } else {
+                                println!("Multiple peers pending — specify fingerprint prefix, e.g.: w a1b2");
+                                None
+                            };
+
+                            if let Some(fp) = target {
+                                if let Some(p) = pending.remove(&fp) {
+                                    peer_auth.apply_decision(&fp, &p.name, decision);
+                                    println!("Decision applied for peer {:?}.", p.name);
+                                }
+                            } else if prefix.is_some() {
+                                println!("No pending peer matching that prefix.");
+                            }
+                        }
+                    }
+                    Ok(None) => break, // EOF
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Error reading stdin");
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Load the node ID from the database, or generate a new one.
