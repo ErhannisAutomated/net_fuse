@@ -16,6 +16,7 @@ use net_fuse::net::discovery::Discovery;
 use net_fuse::net::peer_auth::{AuthDecision, PeerAuth, PendingPeer};
 use net_fuse::net::peer_manager::PeerManager;
 use net_fuse::net::transport::Transport;
+use net_fuse::net::web::WebServer;
 use net_fuse::store::BlobStore;
 use net_fuse::sync::SyncEngine;
 
@@ -48,11 +49,11 @@ async fn main() -> Result<()> {
     // --- Phase 2+3: Networking & Sync ---
 
     // Load or generate TLS identity
-    let identity = NodeIdentity::load_or_generate(
+    let identity = Arc::new(NodeIdentity::load_or_generate(
         &config.cert_path,
         &config.key_path,
         &config.node_name,
-    )?;
+    )?);
     let server_config = identity.build_server_config()?;
     let client_config = identity.build_client_config()?;
     info!("TLS identity loaded");
@@ -133,6 +134,25 @@ async fn main() -> Result<()> {
         peer_connected_rx,
     );
     tokio::spawn(sync_engine.run());
+
+    // --- Phase 6: Web Server ---
+
+    let web_server = Arc::new(WebServer::new(
+        db.clone(),
+        store.clone(),
+        peer_auth.clone(),
+        sync_tx.clone(),
+        node_id,
+        identity.clone(),
+    ));
+    let web_port = config.web_port;
+    tokio::spawn(async move {
+        if let Err(e) = web_server.run(web_port).await {
+            tracing::error!(error = %e, "Web server failed");
+        }
+    });
+    println!("Web interface: https://localhost:{}", config.web_port);
+    println!("Enroll at: https://localhost:{}/enroll", config.web_port);
 
     // --- Phase 5: Cache Eviction ---
 

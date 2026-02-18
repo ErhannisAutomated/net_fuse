@@ -43,6 +43,10 @@ pub struct CliArgs {
     /// Interval in seconds between eviction cycles (default 5 min).
     #[arg(long, default_value_t = 300)]
     pub eviction_interval: u64,
+
+    /// Port for the HTTPS web interface.
+    #[arg(long, default_value_t = 8443)]
+    pub web_port: u16,
 }
 
 /// Resolved application configuration.
@@ -60,6 +64,7 @@ pub struct AppConfig {
     pub cache_hard_limit: u64,
     pub cache_max_age_secs: u64,
     pub eviction_interval_secs: u64,
+    pub web_port: u16,
 }
 
 impl AppConfig {
@@ -100,6 +105,7 @@ impl AppConfig {
             cache_hard_limit: args.cache_hard_limit,
             cache_max_age_secs: args.cache_max_age,
             eviction_interval_secs: args.eviction_interval,
+            web_port: args.web_port,
         })
     }
 

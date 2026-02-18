@@ -64,6 +64,27 @@ impl NodeIdentity {
         )))
     }
 
+    /// Build a rustls ServerConfig for HTTPS (web interface).
+    /// Requests client certs but accepts any (app-layer auth via PeerAuth).
+    pub fn build_https_config(&self) -> anyhow::Result<rustls::ServerConfig> {
+        let client_verifier = Arc::new(AcceptAnyClientCert);
+        let mut server_crypto = rustls::ServerConfig::builder_with_provider(crypto_provider())
+            .with_safe_default_protocol_versions()?
+            .with_client_cert_verifier(client_verifier)
+            .with_single_cert(vec![self.cert()], self.key())?;
+        server_crypto.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        Ok(server_crypto)
+    }
+
+    /// Generate a new client certificate + key pair for web client enrollment.
+    /// Returns `(cert_der, key_der)`.
+    pub fn generate_client_identity(name: &str) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+        let certified_key = rcgen::generate_simple_self_signed(vec![name.to_string()])?;
+        let cert_der = certified_key.cert.der().to_vec();
+        let key_der = certified_key.key_pair.serialize_der();
+        Ok((cert_der, key_der))
+    }
+
     /// Build a quinn ClientConfig for connecting to peers.
     /// Accepts any server certificate (self-signed); trust is verified at
     /// the application layer after Hello exchange.

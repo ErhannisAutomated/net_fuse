@@ -30,5 +30,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rcgen = "0.13"
 mdns-sd = "0.12"
 
+# Phase 6: Web client
+axum = { version = "0.8", features = ["multipart"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+tower = "0.5"
+rand = "0.9"
+
 [dev-dependencies]
 tempfile = "3"
