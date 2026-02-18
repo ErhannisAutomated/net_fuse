@@ -47,6 +47,8 @@ pub struct SyncEngine {
     remote_rx: mpsc::Receiver<(Uuid, Message)>,
     /// Receives notification when a new peer connects (for initial sync).
     peer_connected_rx: mpsc::Receiver<Uuid>,
+    /// Whether to include transitive peer states in FullSyncResponse messages.
+    propagate_peer_states: bool,
 }
 
 impl SyncEngine {
@@ -56,6 +58,7 @@ impl SyncEngine {
         local_rx: mpsc::UnboundedReceiver<SyncEvent>,
         remote_rx: mpsc::Receiver<(Uuid, Message)>,
         peer_connected_rx: mpsc::Receiver<Uuid>,
+        propagate_peer_states: bool,
     ) -> Self {
         Self {
             db,
@@ -63,6 +66,7 @@ impl SyncEngine {
             local_rx,
             remote_rx,
             peer_connected_rx,
+            propagate_peer_states,
         }
     }
 
@@ -169,8 +173,8 @@ impl SyncEngine {
             Message::FullSyncRequest => {
                 self.handle_full_sync_request(peer_id).await;
             }
-            Message::FullSyncResponse { entries } => {
-                self.handle_full_sync_response(peer_id, entries).await;
+            Message::FullSyncResponse { entries, peer_states } => {
+                self.handle_full_sync_response(peer_id, entries, peer_states).await;
             }
             other => {
                 debug!(%peer_id, ?other, "Ignoring unhandled message type in SyncEngine");
@@ -260,39 +264,62 @@ impl SyncEngine {
             return;
         }
 
-        // Also send our entries to them
-        match self.db.all_entries() {
-            Ok(entries) => {
-                let msg = Message::FullSyncResponse { entries };
-                if let Err(e) = self.transport.send(peer_id, &msg).await {
-                    warn!(%peer_id, error = %e, "Failed to send FullSyncResponse");
-                }
-            }
-            Err(e) => {
-                warn!(%peer_id, error = %e, "Failed to read entries for full sync");
-            }
+        // Also send our entries (and optionally our peer state knowledge) to them
+        if let Err(e) = self.send_full_sync_response(peer_id).await {
+            warn!(%peer_id, error = %e, "Failed to send FullSyncResponse");
         }
     }
 
     /// Handle a FullSyncRequest: send all our entries back.
     async fn handle_full_sync_request(&self, peer_id: Uuid) {
         info!(%peer_id, "Received FullSyncRequest, sending entries");
-        match self.db.all_entries() {
-            Ok(entries) => {
-                let msg = Message::FullSyncResponse { entries };
-                if let Err(e) = self.transport.send(peer_id, &msg).await {
-                    warn!(%peer_id, error = %e, "Failed to send FullSyncResponse");
-                }
-            }
-            Err(e) => {
-                warn!(%peer_id, error = %e, "Failed to read entries for sync response");
-            }
+        if let Err(e) = self.send_full_sync_response(peer_id).await {
+            warn!(%peer_id, error = %e, "Failed to send FullSyncResponse");
         }
     }
 
+    /// Build and send a FullSyncResponse to the given peer.
+    /// Includes peer_states when propagation is enabled.
+    async fn send_full_sync_response(&self, peer_id: Uuid) -> anyhow::Result<()> {
+        let entries = self.db.all_entries()?;
+
+        let peer_states = if self.propagate_peer_states {
+            self.db.get_all_peer_sync_states().unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+
+        let msg = Message::FullSyncResponse {
+            entries,
+            peer_states,
+        };
+        self.transport.send(peer_id, &msg).await
+    }
+
     /// Handle a FullSyncResponse: apply entries, infer offline deletions, prevent resurrections.
-    async fn handle_full_sync_response(&self, peer_id: Uuid, entries: Vec<FileEntry>) {
-        info!(%peer_id, count = entries.len(), "Received FullSyncResponse");
+    async fn handle_full_sync_response(
+        &self,
+        peer_id: Uuid,
+        entries: Vec<FileEntry>,
+        peer_states: HashMap<Uuid, Vec<(String, VectorClock)>>,
+    ) {
+        info!(
+            %peer_id,
+            entries = entries.len(),
+            transitive_peers = peer_states.len(),
+            "Received FullSyncResponse"
+        );
+
+        // Merge transitive peer states before our own inference so any freshly learned
+        // last_known data is available. We skip the sending peer's own entry (we're about
+        // to replace it with authoritative direct data at the end of this function).
+        if self.propagate_peer_states && !peer_states.is_empty() {
+            let mut to_merge = peer_states;
+            to_merge.remove(&peer_id); // don't clobber direct data with transitive data
+            if let Err(e) = self.db.merge_peer_sync_state(&to_merge) {
+                warn!(%peer_id, error = %e, "Failed to merge transitive peer states");
+            }
+        }
 
         // Load what this peer had at our last sync with them.
         let last_known: HashMap<String, VectorClock> =

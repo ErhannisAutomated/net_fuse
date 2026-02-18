@@ -134,6 +134,7 @@ async fn main() -> Result<()> {
         sync_rx,
         incoming_rx,
         peer_connected_rx,
+        config.propagate_peer_states,
     );
     tokio::spawn(sync_engine.run());
 

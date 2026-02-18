@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -46,14 +48,21 @@ pub enum Message {
     FullSyncRequest,
 
     /// Full metadata dump in response.
-    FullSyncResponse { entries: Vec<FileEntry> },
+    FullSyncResponse {
+        entries: Vec<FileEntry>,
+        /// Transitive peer state: what this node knows other peers had at last sync.
+        /// Key: peer node ID. Value: list of (path, last-known-vclock) pairs.
+        /// Used by recipients to infer offline deletions from peers they haven't
+        /// directly synced with. Empty when `propagate_peer_states` is disabled.
+        peer_states: HashMap<Uuid, Vec<(String, VectorClock)>>,
+    },
 }
 
 /// Protocol version constant.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
-/// Maximum message size (16 MiB) to prevent unbounded allocations.
-const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
+/// Maximum message size (64 MiB) — peer_states can be sizeable on larger networks.
+const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
 
 /// Write a length-prefixed, postcard-serialized message to a QUIC send stream.
 pub async fn write_message(

@@ -20,6 +20,10 @@ pub struct ConfigFile {
     pub cache_max_age: Option<u64>,
     pub eviction_interval: Option<u64>,
     pub web_port: Option<u16>,
+    /// Propagate per-peer last-known file states transitively during full sync,
+    /// enabling deletion inference across nodes that never directly connected.
+    /// Disable to trade correctness (file resurrection) for smaller sync messages.
+    pub propagate_peer_states: Option<bool>,
 }
 
 impl ConfigFile {
@@ -81,6 +85,12 @@ pub struct CliArgs {
     /// Port for the HTTPS web interface.
     #[arg(long)]
     pub web_port: Option<u16>,
+
+    /// Propagate peer sync state transitively to enable deletion inference across
+    /// nodes that never directly connected. Default: true.
+    /// Set to false if sync message size is a concern (risks file resurrection).
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub propagate_peer_states: Option<bool>,
 }
 
 /// Resolved application configuration.
@@ -99,6 +109,7 @@ pub struct AppConfig {
     pub cache_max_age_secs: u64,
     pub eviction_interval_secs: u64,
     pub web_port: u16,
+    pub propagate_peer_states: bool,
 }
 
 impl AppConfig {
@@ -172,6 +183,10 @@ impl AppConfig {
                 .or(cfg.eviction_interval)
                 .unwrap_or(300),
             web_port: args.web_port.or(cfg.web_port).unwrap_or(8443),
+            propagate_peer_states: args
+                .propagate_peer_states
+                .or(cfg.propagate_peer_states)
+                .unwrap_or(true),
         })
     }
 

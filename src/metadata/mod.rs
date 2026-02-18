@@ -447,6 +447,77 @@ impl MetadataDb {
         Ok(map)
     }
 
+    /// Fetch the complete peer_sync_state table as a nested map
+    /// `{ peer_id → { path → vclock } }` for transitive propagation.
+    pub fn get_all_peer_sync_states(
+        &self,
+    ) -> Result<HashMap<uuid::Uuid, Vec<(String, VectorClock)>>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT peer_id, path, vclock FROM peer_sync_state ORDER BY peer_id, path",
+        )?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let peer_id_bytes: Vec<u8> = row.get(0)?;
+                let path: String = row.get(1)?;
+                let vclock_bytes: Vec<u8> = row.get(2)?;
+                Ok((peer_id_bytes, path, vclock_bytes))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut result: HashMap<uuid::Uuid, Vec<(String, VectorClock)>> = HashMap::new();
+        for (peer_id_bytes, path, vclock_bytes) in rows {
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&peer_id_bytes);
+            let peer_id = uuid::Uuid::from_bytes(bytes);
+            let vclock = VectorClock::deserialize(&vclock_bytes).unwrap_or_default();
+            result.entry(peer_id).or_default().push((path, vclock));
+        }
+        Ok(result)
+    }
+
+    /// Merge incoming transitive peer states into our own peer_sync_state table,
+    /// taking the element-wise max (VectorClock::merge) for each (peer, path) pair.
+    /// This is safe to call repeatedly; it is monotonically non-decreasing.
+    pub fn merge_peer_sync_state(
+        &self,
+        incoming: &HashMap<uuid::Uuid, Vec<(String, VectorClock)>>,
+    ) -> Result<()> {
+        if incoming.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock();
+        for (peer_id, entries) in incoming {
+            for (path, incoming_vclock) in entries {
+                // Load existing entry (if any) so we can merge clocks.
+                let current_bytes: Option<Vec<u8>> = conn
+                    .query_row(
+                        "SELECT vclock FROM peer_sync_state WHERE peer_id = ?1 AND path = ?2",
+                        params![peer_id.as_bytes().as_slice(), path],
+                        |row| row.get(0),
+                    )
+                    .ok();
+
+                let merged_bytes = match current_bytes {
+                    None => incoming_vclock.serialize(),
+                    Some(bytes) => {
+                        let mut current = VectorClock::deserialize(&bytes).unwrap_or_default();
+                        current.merge(incoming_vclock);
+                        current.serialize()
+                    }
+                };
+
+                conn.execute(
+                    "INSERT INTO peer_sync_state (peer_id, path, vclock) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(peer_id, path) DO UPDATE SET vclock = excluded.vclock",
+                    params![peer_id.as_bytes().as_slice(), path, merged_bytes],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Persist the current file state received from a peer after a full sync,
     /// replacing any previous state for that peer.
     pub fn set_peer_sync_state(
