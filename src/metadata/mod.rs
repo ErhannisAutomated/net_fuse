@@ -1,6 +1,7 @@
 pub mod schema;
 pub mod types;
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -416,6 +417,61 @@ impl MetadataDb {
             "UPDATE blobs SET pinned = 0 WHERE hash = ?1",
             params![hash.as_slice()],
         )?;
+        Ok(())
+    }
+
+    /// Load the last-known file state for a peer (used to infer offline deletions).
+    /// Returns a map of path → vclock as of the most recent full sync with that peer.
+    pub fn get_peer_sync_state(
+        &self,
+        peer_id: uuid::Uuid,
+    ) -> Result<HashMap<String, VectorClock>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT path, vclock FROM peer_sync_state WHERE peer_id = ?1",
+        )?;
+
+        let rows = stmt
+            .query_map(params![peer_id.as_bytes().as_slice()], |row| {
+                let path: String = row.get(0)?;
+                let vclock_bytes: Vec<u8> = row.get(1)?;
+                Ok((path, vclock_bytes))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut map = HashMap::with_capacity(rows.len());
+        for (path, vclock_bytes) in rows {
+            let vclock = VectorClock::deserialize(&vclock_bytes).unwrap_or_default();
+            map.insert(path, vclock);
+        }
+        Ok(map)
+    }
+
+    /// Persist the current file state received from a peer after a full sync,
+    /// replacing any previous state for that peer.
+    pub fn set_peer_sync_state(
+        &self,
+        peer_id: uuid::Uuid,
+        entries: &[FileEntry],
+    ) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM peer_sync_state WHERE peer_id = ?1",
+            params![peer_id.as_bytes().as_slice()],
+        )?;
+        for entry in entries {
+            if entry.path == "/" {
+                continue; // root is never used for deletion inference
+            }
+            conn.execute(
+                "INSERT INTO peer_sync_state (peer_id, path, vclock) VALUES (?1, ?2, ?3)",
+                params![
+                    peer_id.as_bytes().as_slice(),
+                    entry.path,
+                    entry.vclock.serialize(),
+                ],
+            )?;
+        }
         Ok(())
     }
 

@@ -64,6 +64,16 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch("ALTER TABLE blobs ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;")?;
     }
 
+    // Migration: add peer_sync_state table (idempotent).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS peer_sync_state (
+            peer_id BLOB NOT NULL,
+            path    TEXT NOT NULL,
+            vclock  BLOB NOT NULL,
+            PRIMARY KEY (peer_id, path)
+        );",
+    )?;
+
     Ok(())
 }
 

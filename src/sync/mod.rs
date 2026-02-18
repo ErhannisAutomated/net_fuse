@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -289,14 +290,82 @@ impl SyncEngine {
         }
     }
 
-    /// Handle a FullSyncResponse: apply all entries from the peer.
+    /// Handle a FullSyncResponse: apply entries, infer offline deletions, prevent resurrections.
     async fn handle_full_sync_response(&self, peer_id: Uuid, entries: Vec<FileEntry>) {
         info!(%peer_id, count = entries.len(), "Received FullSyncResponse");
+
+        // Load what this peer had at our last sync with them.
+        let last_known: HashMap<String, VectorClock> =
+            self.db.get_peer_sync_state(peer_id).unwrap_or_default();
+
+        // Build an index of paths in this response for fast lookup.
+        let peer_entry_map: HashMap<&str, &FileEntry> = entries
+            .iter()
+            .map(|e| (e.path.as_str(), e))
+            .collect();
+
+        // --- Infer offline deletions ---
+        // Any path in last_known that is now absent from the peer's response was deleted by
+        // the peer while we were disconnected.
+        for (path, last_vclock) in &last_known {
+            if path == "/" {
+                continue;
+            }
+            if !peer_entry_map.contains_key(path.as_str()) {
+                info!(%peer_id, %path, "Inferring peer deleted file (absent from full sync)");
+                match self.db.apply_remote_delete(path, last_vclock) {
+                    Ok(ApplyResult::Applied) => {
+                        info!(%peer_id, %path, "Applied inferred peer deletion");
+                        let msg = Message::PathDelete {
+                            path: path.clone(),
+                            vclock: last_vclock.clone(),
+                            origin_node: peer_id,
+                        };
+                        self.transport.broadcast(&msg).await;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(%peer_id, %path, error = %e, "Error applying inferred delete");
+                    }
+                }
+            }
+        }
+
+        // --- Apply peer's entries with resurrection prevention ---
         let mut applied = 0;
         let mut conflicts = 0;
+        let mut skipped = 0;
 
-        for entry in entries {
-            match self.db.apply_remote_update(&entry) {
+        for entry in &entries {
+            if entry.path == "/" {
+                continue;
+            }
+
+            // Resurrection prevention: if we have no local copy of this file but we
+            // previously knew the peer had it (it's in last_known), then WE deleted it
+            // (or a third peer did and we propagated). Only resurrect if the peer has
+            // a strictly newer version than what we last saw — meaning they made a new
+            // change after our delete.
+            if self
+                .db
+                .get_entry(&entry.path)
+                .unwrap_or(None)
+                .is_none()
+            {
+                if let Some(last_vclock) = last_known.get(&entry.path) {
+                    if entry.vclock.partial_cmp(last_vclock)
+                        != Some(std::cmp::Ordering::Greater)
+                    {
+                        // Peer hasn't changed this file since our last sync — our delete wins.
+                        debug!(%peer_id, path = %entry.path, "Skipping resurrection of locally-deleted file");
+                        skipped += 1;
+                        continue;
+                    }
+                    // Peer has a genuinely newer version → apply it (their update overrides our delete)
+                }
+            }
+
+            match self.db.apply_remote_update(entry) {
                 Ok(ApplyResult::Applied) => applied += 1,
                 Ok(ApplyResult::Conflict) => conflicts += 1,
                 Ok(ApplyResult::Ignored) => {}
@@ -306,7 +375,12 @@ impl SyncEngine {
             }
         }
 
-        info!(%peer_id, applied, conflicts, "Full sync complete");
+        // Save peer's current state so we can infer future offline deletions.
+        if let Err(e) = self.db.set_peer_sync_state(peer_id, &entries) {
+            warn!(%peer_id, error = %e, "Failed to save peer sync state");
+        }
+
+        info!(%peer_id, applied, conflicts, skipped_resurrections = skipped, "Full sync complete");
     }
 
     /// Broadcast a message to all peers except the specified one (for flood-fill).

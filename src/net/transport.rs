@@ -492,6 +492,11 @@ impl Transport {
         Ok(self.endpoint.local_addr()?)
     }
 
+    /// Get our node ID.
+    pub fn node_id(&self) -> Uuid {
+        self.node_id
+    }
+
     /// Fetch a blob from a specific peer by opening a bi-directional stream.
     pub async fn fetch_blob(&self, peer_id: Uuid, hash: &BlobHash) -> anyhow::Result<Vec<u8>> {
         let conn = {

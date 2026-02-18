@@ -63,11 +63,13 @@ async fn main() -> Result<()> {
     println!("Our fingerprint: SHA256:{our_fingerprint}");
 
     let (pending_tx, pending_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (approved_tx, approved_rx) = tokio::sync::mpsc::unbounded_channel();
     let peer_auth = Arc::new(PeerAuth::new(
         config.data_dir.join("peer_auth.json"),
         our_fingerprint,
         pending_tx,
     ));
+    peer_auth.set_approved_notifier(approved_tx);
 
     // Create channels for Transport -> SyncEngine communication
     let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel(256);
@@ -111,7 +113,7 @@ async fn main() -> Result<()> {
     // Start peer manager (handles mDNS discoveries -> outgoing connections)
     let peer_mgr = PeerManager::new(transport.clone());
     tokio::spawn(async move {
-        peer_mgr.handle_discoveries(discovered_rx).await;
+        peer_mgr.handle_discoveries(discovered_rx, approved_rx).await;
     });
 
     // --- Peer authorization UI tasks ---

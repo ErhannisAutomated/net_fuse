@@ -53,6 +53,9 @@ pub struct PeerAuth {
     session_allowed: Mutex<HashSet<String>>,
     session_ignored: Mutex<HashSet<String>>,
     pending_tx: mpsc::UnboundedSender<PendingPeer>,
+    /// Notified when a peer is allowed (Whitelist or SessionAllow), so PeerManager
+    /// can immediately retry pending connections instead of waiting for mDNS.
+    approved_tx: Mutex<Option<mpsc::UnboundedSender<()>>>,
 }
 
 impl PeerAuth {
@@ -71,12 +74,19 @@ impl PeerAuth {
             session_allowed: Mutex::new(HashSet::new()),
             session_ignored: Mutex::new(HashSet::new()),
             pending_tx,
+            approved_tx: Mutex::new(None),
         }
     }
 
     /// Our own certificate fingerprint.
     pub fn our_fingerprint(&self) -> &str {
         &self.our_fingerprint
+    }
+
+    /// Register a channel to notify when a peer is approved (Whitelist or SessionAllow).
+    /// PeerManager calls this so it can retry connections immediately after approval.
+    pub fn set_approved_notifier(&self, tx: mpsc::UnboundedSender<()>) {
+        *self.approved_tx.lock() = Some(tx);
     }
 
     /// Check authorization status for a peer fingerprint.
@@ -120,10 +130,16 @@ impl PeerAuth {
                     },
                 );
                 info!(fingerprint = &fingerprint[..16], name, "Peer whitelisted (persistent)");
+                if let Some(tx) = &*self.approved_tx.lock() {
+                    let _ = tx.send(());
+                }
             }
             AuthDecision::SessionAllow => {
                 self.session_allowed.lock().insert(fingerprint.to_string());
                 info!(fingerprint = &fingerprint[..16], name, "Peer session-allowed");
+                if let Some(tx) = &*self.approved_tx.lock() {
+                    let _ = tx.send(());
+                }
             }
             AuthDecision::SessionIgnore => {
                 self.session_ignored.lock().insert(fingerprint.to_string());
