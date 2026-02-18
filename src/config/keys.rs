@@ -65,9 +65,11 @@ impl NodeIdentity {
     }
 
     /// Build a rustls ServerConfig for HTTPS (web interface).
-    /// Requests client certs but accepts any (app-layer auth via PeerAuth).
+    /// Client certs are **optional** — unauthenticated clients can reach /enroll.
+    /// If a client cert is presented it is accepted without CA verification;
+    /// real authorization happens at the application layer via PeerAuth.
     pub fn build_https_config(&self) -> anyhow::Result<rustls::ServerConfig> {
-        let client_verifier = Arc::new(AcceptAnyClientCert);
+        let client_verifier = Arc::new(OptionalClientCert);
         let mut server_crypto = rustls::ServerConfig::builder_with_provider(crypto_provider())
             .with_safe_default_protocol_versions()?
             .with_client_cert_verifier(client_verifier)
@@ -112,6 +114,59 @@ fn crypto_provider() -> Arc<CryptoProvider> {
 struct AcceptAnyClientCert;
 
 impl ClientCertVerifier for AcceptAnyClientCert {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, TlsError> {
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Client certificate verifier that **optionally** accepts any client certificate.
+/// Unlike `AcceptAnyClientCert`, this returns `client_auth_mandatory() == false`,
+/// so TLS connections without a client cert are allowed (needed for /enroll).
+#[derive(Debug)]
+struct OptionalClientCert;
+
+impl ClientCertVerifier for OptionalClientCert {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
         &[]
     }

@@ -3,15 +3,19 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Multipart, Query, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Query, Request, State};
 use axum::http::{header, StatusCode};
+use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use parking_lot::Mutex;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -23,6 +27,11 @@ use crate::store::BlobStore;
 use crate::sync::SyncEvent;
 
 static WEB_UI_HTML: &str = include_str!("web_ui.html");
+
+/// Client certificate fingerprint extracted from the TLS connection.
+/// `None` means no client certificate was presented.
+#[derive(Clone)]
+pub(crate) struct ClientFingerprint(pub(crate) Option<String>);
 
 /// Token pair for two-factor enrollment.
 struct EnrollmentTokenPair {
@@ -102,36 +111,115 @@ impl WebServer {
     /// Start the HTTPS web server.
     pub async fn run(self: Arc<Self>, port: u16) -> anyhow::Result<()> {
         let rustls_config = self.identity.build_https_config()?;
+        let tls_acceptor = TlsAcceptor::from(Arc::new(rustls_config));
 
-        // Build routes — enrollment routes are unauthenticated
-        let enroll_routes = Router::new()
-            .route("/enroll", get(handle_enroll_page))
-            .route("/enroll", post(handle_enroll_submit))
-            .with_state(self.clone());
+        let app = build_router(self.clone());
 
-        // Authenticated API routes
-        let api_routes = Router::new()
-            .route("/", get(handle_index))
-            .route("/api/ls", get(handle_ls))
-            .route("/api/file", get(handle_download))
-            .route("/api/meta", get(handle_meta))
-            .route("/api/upload", post(handle_upload))
-            .route("/api/file", delete(handle_delete))
-            .route("/api/mkdir", post(handle_mkdir))
-            .layer(DefaultBodyLimit::max(256 * 1024 * 1024)) // 256 MB upload limit
-            .with_state(self.clone());
+        let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
+        info!(port, "Web server listening");
 
-        let app = Router::new().merge(enroll_routes).merge(api_routes);
+        loop {
+            let (tcp_stream, _remote_addr) = listener.accept().await?;
+            let acceptor = tls_acceptor.clone();
+            let app = app.clone();
 
-        let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(rustls_config));
-        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+            tokio::spawn(async move {
+                // TLS handshake
+                let tls_stream = match acceptor.accept(tcp_stream).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "TLS handshake failed");
+                        return;
+                    }
+                };
 
-        info!(%addr, "Web server listening");
-        axum_server::bind_rustls(addr, tls_config)
-            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-            .await?;
+                // Extract client cert fingerprint from the TLS session
+                let fingerprint = tls_stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .and_then(|certs| certs.first())
+                    .map(|cert| crate::cert_fingerprint(cert.as_ref()));
+                let client_fp = ClientFingerprint(fingerprint);
 
-        Ok(())
+                // Wrap the axum router so we can inject the fingerprint extension
+                let service = hyper::service::service_fn(
+                    move |req: Request<hyper::body::Incoming>| {
+                        let mut app = app.clone();
+                        let fp = client_fp.clone();
+                        async move {
+                            use tower::Service;
+                            let (mut parts, body) = req.into_parts();
+                            parts.extensions.insert(fp);
+                            let req = Request::from_parts(parts, Body::new(body));
+                            app.call(req).await.map_err(|e| match e {})
+                        }
+                    },
+                );
+
+                let io = TokioIo::new(tls_stream);
+                let conn = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+                if let Err(e) = conn.serve_connection(io, service).await {
+                    tracing::debug!(error = %e, "HTTP connection error");
+                }
+            });
+        }
+    }
+}
+
+/// Build the axum Router with all routes. Extracted as a standalone function
+/// so tests can call handlers directly (via `tower::ServiceExt::oneshot`)
+/// without TLS.
+pub(crate) fn build_router(state: AppState) -> Router {
+    // Enrollment routes — unauthenticated
+    let enroll_routes = Router::new()
+        .route("/enroll", get(handle_enroll_page))
+        .route("/enroll", post(handle_enroll_submit));
+
+    // Authenticated API routes — protected by auth_middleware
+    let api_routes = Router::new()
+        .route("/", get(handle_index))
+        .route("/api/ls", get(handle_ls))
+        .route("/api/file", get(handle_download))
+        .route("/api/meta", get(handle_meta))
+        .route("/api/upload", post(handle_upload))
+        .route("/api/file", delete(handle_delete))
+        .route("/api/mkdir", post(handle_mkdir))
+        .layer(DefaultBodyLimit::max(256 * 1024 * 1024)) // 256 MB upload limit
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    Router::new()
+        .merge(enroll_routes)
+        .merge(api_routes)
+        .with_state(state)
+}
+
+/// Middleware that checks `ClientFingerprint` against PeerAuth.
+/// Returns 403 if no valid client cert or not whitelisted.
+async fn auth_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let allowed = req
+        .extensions()
+        .get::<ClientFingerprint>()
+        .and_then(|cf| cf.0.as_ref())
+        .map(|fp| {
+            matches!(
+                state.peer_auth.check(fp),
+                crate::net::peer_auth::AuthResult::Allowed
+            )
+        })
+        .unwrap_or(false);
+
+    if allowed {
+        next.run(req).await
+    } else {
+        (StatusCode::FORBIDDEN, "Forbidden").into_response()
     }
 }
 
@@ -139,36 +227,9 @@ impl WebServer {
 fn gen_token() -> String {
     const CHARS: &[u8] = b"abcdefghijkmnpqrstuvwxyz23456789"; // no confusing chars
     let mut rng = rand::rng();
-    (0..6).map(|_| CHARS[rng.random_range(0..CHARS.len())] as char).collect()
-}
-
-/// Check client cert auth. Returns Ok(()) if authorized, Err(response) otherwise.
-fn check_auth(state: &WebServer, headers: &axum::http::HeaderMap) -> Result<(), StatusCode> {
-    // axum-server with tls-rustls doesn't directly expose client certs in headers.
-    // The client cert is validated at the TLS layer by AcceptAnyClientCert.
-    // We check via the X-Client-Cert-Fingerprint header that our TLS middleware could inject,
-    // but since axum-server doesn't natively pass client cert info to handlers,
-    // we rely on a simpler approach: if the TLS handshake succeeds with a client cert,
-    // we extract the fingerprint from the connection.
-    //
-    // For now, we check for the presence of a custom header set by the TLS layer.
-    // If no client cert was presented, the request still succeeds at the TLS layer
-    // (AcceptAnyClientCert), but we gate API access here.
-    //
-    // Since axum-server doesn't expose client certs easily, we use a workaround:
-    // check the X-Client-Cert-Fingerprint header. In production, this would be set
-    // by a TLS termination proxy. For our self-contained server, the enrollment
-    // flow will whitelist the fingerprint, and we'll check it here.
-    if let Some(fp) = headers.get("X-Client-Cert-Fingerprint") {
-        if let Ok(fp_str) = fp.to_str() {
-            match state.peer_auth.check(fp_str) {
-                crate::net::peer_auth::AuthResult::Allowed => return Ok(()),
-                _ => return Err(StatusCode::FORBIDDEN),
-            }
-        }
-    }
-    // If no fingerprint header, deny access to authenticated endpoints
-    Err(StatusCode::FORBIDDEN)
+    (0..6)
+        .map(|_| CHARS[rng.random_range(0..CHARS.len())] as char)
+        .collect()
 }
 
 // ---- Enrollment Handlers ----
@@ -190,7 +251,8 @@ async fn handle_enroll_page(State(state): State<AppState>) -> impl IntoResponse 
         expires: Instant::now() + std::time::Duration::from_secs(300),
     });
 
-    Html(format!(r#"<!DOCTYPE html>
+    Html(format!(
+        r#"<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>NetFuse - Enroll</title>
 <style>
@@ -212,7 +274,8 @@ button:hover {{ background: #2980b9; }}
 <input type="text" name="console_token" placeholder="Enter code" maxlength="6" autofocus>
 <button type="submit">Enroll</button>
 </form>
-</div></body></html>"#))
+</div></body></html>"#
+    ))
 }
 
 async fn handle_enroll_submit(
@@ -250,8 +313,11 @@ async fn handle_enroll_submit(
             warn!(error = %e, "Failed to generate client identity");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Html("<html><body><h2>Failed to generate certificate.</h2></body></html>".to_string()),
-            ).into_response();
+                Html(
+                    "<html><body><h2>Failed to generate certificate.</h2></body></html>".to_string(),
+                ),
+            )
+                .into_response();
         }
     };
 
@@ -264,50 +330,60 @@ async fn handle_enroll_submit(
     );
     info!(name = %client_name, fingerprint = &fingerprint[..16], "Web client enrolled and whitelisted");
 
-    // Build PKCS#12 (.p12) bundle
-    // We use a simple password "netfuse" for the .p12 — the user will need it when importing
-    let p12_password = "netfuse";
-    let p12 = match build_p12(&cert_der, &key_der, &client_name, p12_password) {
-        Ok(p12) => p12,
+    // Build PEM bundle
+    let pem = match build_pem(&cert_der, &key_der) {
+        Ok(p) => p,
         Err(e) => {
-            warn!(error = %e, "Failed to build PKCS#12");
+            warn!(error = %e, "Failed to build PEM");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Html("<html><body><h2>Failed to build certificate bundle.</h2></body></html>".to_string()),
-            ).into_response();
+                Html(
+                    "<html><body><h2>Failed to build certificate bundle.</h2></body></html>"
+                        .to_string(),
+                ),
+            )
+                .into_response();
         }
     };
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/x-pkcs12")
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{client_name}.p12\""),
-        )
-        .body(Body::from(p12))
-        .unwrap()
-        .into_response()
+    // Return an HTML page that auto-downloads the PEM file via data: URL
+    let pem_b64 = base64_encode(pem.as_bytes());
+    Html(format!(
+        r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NetFuse - Enrolled</title>
+<style>
+body {{ font-family: -apple-system, sans-serif; background: #f5f5f5; display: flex; justify-content: center; padding-top: 80px; }}
+.card {{ background: #fff; padding: 32px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); max-width: 480px; width: 100%; }}
+h2 {{ margin-bottom: 16px; color: #27ae60; }}
+p {{ color: #555; margin-bottom: 12px; line-height: 1.5; }}
+code {{ background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }}
+a.btn {{ display: inline-block; padding: 10px 20px; background: #3498db; color: #fff; text-decoration: none; border-radius: 4px; margin-top: 8px; }}
+a.btn:hover {{ background: #2980b9; }}
+</style></head><body>
+<div class="card">
+<h2>Enrollment Successful</h2>
+<p>Your client certificate has been generated and your browser is whitelisted.</p>
+<p>Your certificate file <code>{client_name}.pem</code> should download automatically.
+If not, <a class="btn" download="{client_name}.pem" href="data:application/x-pem-file;base64,{pem_b64}">Download Certificate</a></p>
+<p>To use it with <code>curl</code>:</p>
+<p><code>curl --cert {client_name}.pem -k https://HOST:PORT/api/ls?path=/</code></p>
+</div>
+<script>
+var a = document.createElement('a');
+a.href = 'data:application/x-pem-file;base64,{pem_b64}';
+a.download = '{client_name}.pem';
+document.body.appendChild(a);
+a.click();
+document.body.removeChild(a);
+</script>
+</body></html>"#
+    ))
+    .into_response()
 }
 
-/// Build a PKCS#12 archive from DER cert + key.
-fn build_p12(cert_der: &[u8], key_der: &[u8], name: &str, password: &str) -> anyhow::Result<Vec<u8>> {
-    // We'll build a minimal PKCS#12 by re-encoding using rcgen types.
-    // Since we already have DER bytes, we can use the simple PFX builder approach.
-    // However, rcgen doesn't have a PKCS#12 builder, so we'll use a basic DER construction.
-    //
-    // For simplicity, return a PEM bundle instead and instruct the user to convert,
-    // or we build the p12 manually.
-    //
-    // Actually, let's provide PEM files as a download since PKCS#12 construction without
-    // a dedicated library is complex. We'll return a tar-like concatenation with instructions.
-    //
-    // Better approach: return individual PEM files that can be imported.
-    // Most modern browsers support importing PEM certs directly or via openssl conversion.
-    //
-    // For maximum compatibility, let's provide the cert and key as PEM in a single file
-    // with instructions. The user can convert to p12 using openssl if needed.
-
+/// Build PEM bundle containing certificate and private key.
+fn build_pem(cert_der: &[u8], key_der: &[u8]) -> anyhow::Result<String> {
     use std::fmt::Write;
     let mut pem = String::new();
 
@@ -327,10 +403,7 @@ fn build_p12(cert_der: &[u8], key_der: &[u8], name: &str, password: &str) -> any
     }
     writeln!(&mut pem, "-----END PRIVATE KEY-----")?;
 
-    let _ = name;
-    let _ = password;
-
-    Ok(pem.into_bytes())
+    Ok(pem)
 }
 
 fn base64_encode(data: &[u8]) -> String {
@@ -359,44 +432,35 @@ fn base64_encode(data: &[u8]) -> String {
 
 // ---- Authenticated Handlers ----
 
-async fn handle_index(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
-    if let Err(status) = check_auth(&state, &headers) {
-        return (status, Html(String::from(
-            "<html><body><h2>403 Forbidden</h2><p>Client certificate required. <a href=\"/enroll\">Enroll</a></p></body></html>"
-        ))).into_response();
-    }
-    Html(WEB_UI_HTML.to_string()).into_response()
+async fn handle_index(State(_state): State<AppState>) -> impl IntoResponse {
+    Html(WEB_UI_HTML.to_string())
 }
 
 async fn handle_ls(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
     Query(q): Query<PathQuery>,
 ) -> impl IntoResponse {
-    if let Err(status) = check_auth(&state, &headers) {
-        return (status, "Forbidden").into_response();
-    }
-
     let parent = normalize_dir_path(&q.path);
     match state.db.list_children(&parent) {
         Ok(entries) => {
-            let ls: Vec<LsEntry> = entries.into_iter().map(|e| {
-                let name = e.path.rsplit('/').next().unwrap_or(&e.path).to_string();
-                LsEntry {
-                    name,
-                    kind: match e.kind {
-                        EntryKind::Directory => "directory",
-                        EntryKind::File => "file",
-                        EntryKind::Symlink => "symlink",
-                    },
-                    size: e.size,
-                    mtime_secs: e.mtime.secs,
-                    permissions: e.permissions,
-                }
-            }).collect();
+            let ls: Vec<LsEntry> = entries
+                .into_iter()
+                .map(|e| {
+                    let trimmed = e.path.trim_end_matches('/');
+                    let name = trimmed.rsplit('/').next().unwrap_or(trimmed).to_string();
+                    LsEntry {
+                        name,
+                        kind: match e.kind {
+                            EntryKind::Directory => "directory",
+                            EntryKind::File => "file",
+                            EntryKind::Symlink => "symlink",
+                        },
+                        size: e.size,
+                        mtime_secs: e.mtime.secs,
+                        permissions: e.permissions,
+                    }
+                })
+                .collect();
             axum::Json(ls).into_response()
         }
         Err(e) => {
@@ -408,13 +472,8 @@ async fn handle_ls(
 
 async fn handle_download(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
     Query(q): Query<PathQuery>,
 ) -> impl IntoResponse {
-    if let Err(status) = check_auth(&state, &headers) {
-        return (status, "Forbidden").into_response();
-    }
-
     let path = normalize_file_path(&q.path);
     match state.db.get_entry(&path) {
         Ok(Some(entry)) => {
@@ -452,13 +511,8 @@ async fn handle_download(
 
 async fn handle_meta(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
     Query(q): Query<PathQuery>,
 ) -> impl IntoResponse {
-    if let Err(status) = check_auth(&state, &headers) {
-        return (status, "Forbidden").into_response();
-    }
-
     let path = normalize_file_path(&q.path);
     match state.db.get_entry(&path) {
         Ok(Some(entry)) => {
@@ -487,14 +541,9 @@ async fn handle_meta(
 
 async fn handle_upload(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
     Query(q): Query<PathQuery>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
-    if let Err(status) = check_auth(&state, &headers) {
-        return (status, "Forbidden").into_response();
-    }
-
     let parent = normalize_dir_path(&q.path);
 
     while let Ok(Some(field)) = multipart.next_field().await {
@@ -543,13 +592,8 @@ async fn handle_upload(
 
 async fn handle_delete(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
     Query(q): Query<PathQuery>,
 ) -> impl IntoResponse {
-    if let Err(status) = check_auth(&state, &headers) {
-        return (status, "Forbidden").into_response();
-    }
-
     let path = normalize_file_path(&q.path);
 
     match state.db.get_entry(&path) {
@@ -589,13 +633,8 @@ async fn handle_delete(
 
 async fn handle_mkdir(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
     Query(q): Query<PathQuery>,
 ) -> impl IntoResponse {
-    if let Err(status) = check_auth(&state, &headers) {
-        return (status, "Forbidden").into_response();
-    }
-
     let path = normalize_dir_path(&q.path);
     // Determine parent
     let trimmed = path.trim_end_matches('/');
@@ -638,4 +677,331 @@ fn normalize_file_path(path: &str) -> String {
         p.pop();
     }
     p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    /// Create test state with in-memory DB, temp blob store, and real PeerAuth.
+    fn test_state() -> AppState {
+        let node_id = Uuid::new_v4();
+        let db = Arc::new(MetadataDb::open_memory(node_id).unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(BlobStore::new(tmp.path().join("blobs")).unwrap());
+        let (pending_tx, _pending_rx) = mpsc::unbounded_channel();
+        let peer_auth = Arc::new(PeerAuth::new(
+            tmp.path().join("peer_auth.json"),
+            "test-self".to_string(),
+            pending_tx,
+        ));
+        let (sync_tx, _sync_rx) = mpsc::unbounded_channel();
+        let identity = Arc::new(
+            NodeIdentity::load_or_generate(
+                &tmp.path().join("cert.der"),
+                &tmp.path().join("key.der"),
+                "test-node",
+            )
+            .unwrap(),
+        );
+
+        // Leak the tempdir so it stays alive for the duration of tests
+        std::mem::forget(tmp);
+
+        Arc::new(WebServer::new(
+            db, store, peer_auth, sync_tx, node_id, identity,
+        ))
+    }
+
+    /// Helper to read response body as string.
+    async fn body_string(resp: Response) -> String {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_enroll_page() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .uri("/enroll")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(body.contains("NetFuse Enrollment"));
+        assert!(body.contains("web_token"));
+    }
+
+    #[tokio::test]
+    async fn test_enroll_submit_valid() {
+        let state = test_state();
+
+        // Step 1: Get enrollment page to generate tokens
+        let app = build_router(state.clone());
+        let req = Request::builder()
+            .uri("/enroll")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = body_string(resp).await;
+
+        // Extract web_token from the hidden field
+        let web_token = body
+            .split("name=\"web_token\" value=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_string();
+
+        // Get console_token from the enrollment state
+        let console_token = {
+            let guard = state.enrollment.lock();
+            guard.as_ref().unwrap().console_token.clone()
+        };
+
+        // Step 2: Submit enrollment form
+        let app = build_router(state.clone());
+        let form_body = format!("web_token={web_token}&console_token={console_token}");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/enroll")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(form_body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(body.contains("Enrollment Successful"));
+        assert!(body.contains(".pem"));
+
+        // Verify the fingerprint was whitelisted in PeerAuth
+        // (We can't easily extract the exact fingerprint, but we can verify the
+        // enrollment state was consumed)
+        assert!(state.enrollment.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_enroll_submit_invalid_token() {
+        let state = test_state();
+
+        // Generate tokens first
+        let app = build_router(state.clone());
+        let req = Request::builder()
+            .uri("/enroll")
+            .body(Body::empty())
+            .unwrap();
+        app.oneshot(req).await.unwrap();
+
+        // Submit with wrong console_token
+        let app = build_router(state.clone());
+        let form_body = "web_token=wrong&console_token=wrong1";
+        let req = Request::builder()
+            .method("POST")
+            .uri("/enroll")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(form_body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_api_ls_authed() {
+        let state = test_state();
+        let fp = "test-fingerprint-abc123";
+        state.peer_auth.apply_decision(
+            fp,
+            "test-client",
+            crate::net::peer_auth::AuthDecision::Whitelist,
+        );
+
+        let app = build_router(state);
+        let mut req = Request::builder()
+            .uri("/api/ls?path=/")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ClientFingerprint(Some(fp.to_string())));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp).await;
+        // Should return a JSON array (root dir listing, may be empty)
+        assert!(body.starts_with('['));
+    }
+
+    #[tokio::test]
+    async fn test_api_ls_unauthed() {
+        let state = test_state();
+        let app = build_router(state);
+
+        // No ClientFingerprint extension → 403
+        let req = Request::builder()
+            .uri("/api/ls?path=/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // With unknown fingerprint → 403
+        let state2 = test_state();
+        let app2 = build_router(state2);
+        let mut req2 = Request::builder()
+            .uri("/api/ls?path=/")
+            .body(Body::empty())
+            .unwrap();
+        req2.extensions_mut()
+            .insert(ClientFingerprint(Some("unknown-fp".to_string())));
+        let resp2 = app2.oneshot(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_upload_and_download() {
+        let state = test_state();
+        let fp = "upload-test-fp";
+        state.peer_auth.apply_decision(
+            fp,
+            "uploader",
+            crate::net::peer_auth::AuthDecision::Whitelist,
+        );
+
+        // Upload a file via multipart
+        let boundary = "----testboundary";
+        let file_content = b"hello world from upload test";
+        let multipart_body = format!(
+            "------testboundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"test.txt\"\r\nContent-Type: application/octet-stream\r\n\r\n{}\r\n------testboundary--\r\n",
+            std::str::from_utf8(file_content).unwrap()
+        );
+
+        let app = build_router(state.clone());
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/api/upload?path=/")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(multipart_body))
+            .unwrap();
+        req.extensions_mut()
+            .insert(ClientFingerprint(Some(fp.to_string())));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Download the file
+        let app = build_router(state.clone());
+        let mut req = Request::builder()
+            .uri("/api/file?path=/test.txt")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ClientFingerprint(Some(fp.to_string())));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert_eq!(body, "hello world from upload test");
+    }
+
+    #[tokio::test]
+    async fn test_mkdir() {
+        let state = test_state();
+        let fp = "mkdir-test-fp";
+        state.peer_auth.apply_decision(
+            fp,
+            "dir-maker",
+            crate::net::peer_auth::AuthDecision::Whitelist,
+        );
+
+        // Create directory
+        let app = build_router(state.clone());
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/api/mkdir?path=/mydir")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ClientFingerprint(Some(fp.to_string())));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Verify it appears in ls
+        let app = build_router(state.clone());
+        let mut req = Request::builder()
+            .uri("/api/ls?path=/")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ClientFingerprint(Some(fp.to_string())));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(body.contains("mydir"));
+    }
+
+    #[tokio::test]
+    async fn test_delete() {
+        let state = test_state();
+        let fp = "delete-test-fp";
+        state.peer_auth.apply_decision(
+            fp,
+            "deleter",
+            crate::net::peer_auth::AuthDecision::Whitelist,
+        );
+
+        // Upload a file first
+        let boundary = "----delboundary";
+        let multipart_body = "------delboundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"todelete.txt\"\r\nContent-Type: application/octet-stream\r\n\r\ndelete me\r\n------delboundary--\r\n";
+
+        let app = build_router(state.clone());
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/api/upload?path=/")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(multipart_body))
+            .unwrap();
+        req.extensions_mut()
+            .insert(ClientFingerprint(Some(fp.to_string())));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Delete the file
+        let app = build_router(state.clone());
+        let mut req = Request::builder()
+            .method("DELETE")
+            .uri("/api/file?path=/todelete.txt")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ClientFingerprint(Some(fp.to_string())));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Verify it's gone
+        let app = build_router(state.clone());
+        let mut req = Request::builder()
+            .uri("/api/file?path=/todelete.txt")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ClientFingerprint(Some(fp.to_string())));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
 }

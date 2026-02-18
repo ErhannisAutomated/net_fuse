@@ -32,9 +32,12 @@ mdns-sd = "0.12"
 
 # Phase 6: Web client
 axum = { version = "0.8", features = ["multipart"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
-tower = "0.5"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1"] }
+tokio-rustls = "0.26"
+tower = { version = "0.5", features = ["util"] }
 rand = "0.9"
 
 [dev-dependencies]
 tempfile = "3"
+http-body-util = "0.1"
