@@ -440,7 +440,7 @@ async fn handle_ls(
     State(state): State<AppState>,
     Query(q): Query<PathQuery>,
 ) -> impl IntoResponse {
-    let parent = normalize_dir_path(&q.path);
+    let parent = normalize_file_path(&q.path);
     match state.db.list_children(&parent) {
         Ok(entries) => {
             let ls: Vec<LsEntry> = entries
@@ -544,7 +544,8 @@ async fn handle_upload(
     Query(q): Query<PathQuery>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
-    let parent = normalize_dir_path(&q.path);
+    // Normalize parent dir: same format FUSE uses — no trailing slash except root.
+    let parent = normalize_file_path(&q.path);
 
     while let Ok(Some(field)) = multipart.next_field().await {
         let filename: String = match field.file_name() {
@@ -574,8 +575,8 @@ async fn handle_upload(
             warn!(error = %e, "Failed to register blob");
         }
 
-        // Upsert file entry
-        let file_path = format!("{}{}", parent, filename);
+        // Build file path: "/" → "/filename", "/sub" → "/sub/filename"
+        let file_path = format!("{}/{}", parent.trim_end_matches('/'), filename);
         let entry = FileEntry::new_file(file_path, parent.clone(), hash, size, state.node_id);
 
         if let Err(e) = state.db.upsert_entry(&entry) {
@@ -635,12 +636,13 @@ async fn handle_mkdir(
     State(state): State<AppState>,
     Query(q): Query<PathQuery>,
 ) -> impl IntoResponse {
-    let path = normalize_dir_path(&q.path);
-    // Determine parent
-    let trimmed = path.trim_end_matches('/');
-    let parent = match trimmed.rsplit_once('/') {
-        Some((p, _)) if !p.is_empty() => format!("{p}/"),
-        _ => "/".to_string(),
+    // Store without trailing slash — same format FUSE uses.
+    let path = normalize_file_path(&q.path);
+    // Determine parent: everything before the last '/'
+    let parent = match path.rsplit_once('/') {
+        Some(("", _)) => "/".to_string(), // "/mydir" → parent "/"
+        Some((p, _)) => p.to_string(),    // "/a/b"   → parent "/a"
+        None => "/".to_string(),
     };
 
     let entry = FileEntry::new_dir(path.clone(), parent, state.node_id);
@@ -655,19 +657,7 @@ async fn handle_mkdir(
     (StatusCode::OK, "Created").into_response()
 }
 
-/// Normalize a directory path to have a leading and trailing '/'.
-fn normalize_dir_path(path: &str) -> String {
-    let mut p = path.to_string();
-    if !p.starts_with('/') {
-        p.insert(0, '/');
-    }
-    if !p.ends_with('/') {
-        p.push('/');
-    }
-    p
-}
-
-/// Normalize a file path to have a leading '/' and no trailing '/'.
+/// Normalize a path to have a leading '/' and no trailing '/'.
 fn normalize_file_path(path: &str) -> String {
     let mut p = path.to_string();
     if !p.starts_with('/') {
