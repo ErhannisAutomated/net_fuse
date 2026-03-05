@@ -28,6 +28,12 @@ use crate::sync::SyncEvent;
 
 static WEB_UI_HTML: &str = include_str!("web_ui.html");
 
+/// Response shape for /api/config.
+#[derive(Serialize)]
+struct ConfigResponse {
+    readonly: bool,
+}
+
 /// Client certificate fingerprint extracted from the TLS connection.
 /// `None` means no client certificate was presented.
 #[derive(Clone)]
@@ -48,6 +54,8 @@ pub struct WebServer {
     sync_tx: mpsc::UnboundedSender<SyncEvent>,
     node_id: Uuid,
     enrollment: Mutex<Option<EnrollmentTokenPair>>,
+    /// Separate token pair for viewer-cert enrollment.
+    viewer_enrollment: Mutex<Option<EnrollmentTokenPair>>,
     identity: Arc<NodeIdentity>,
 }
 
@@ -104,19 +112,34 @@ impl WebServer {
             sync_tx,
             node_id,
             enrollment: Mutex::new(None),
+            viewer_enrollment: Mutex::new(None),
             identity,
         }
     }
 
-    /// Start the HTTPS web server.
+    /// Start the full-access HTTPS web server.
     pub async fn run(self: Arc<Self>, port: u16) -> anyhow::Result<()> {
+        let app = build_router(self.clone());
+        self.run_tls_loop(port, app, "Web server").await
+    }
+
+    /// Start the read-only viewer HTTPS web server.
+    pub async fn run_viewer(self: Arc<Self>, port: u16) -> anyhow::Result<()> {
+        let app = build_viewer_router(self.clone());
+        self.run_tls_loop(port, app, "Viewer web server").await
+    }
+
+    /// Shared TLS accept loop used by both `run` and `run_viewer`.
+    async fn run_tls_loop(
+        self: Arc<Self>,
+        port: u16,
+        app: Router,
+        label: &'static str,
+    ) -> anyhow::Result<()> {
         let rustls_config = self.identity.build_https_config()?;
         let tls_acceptor = TlsAcceptor::from(Arc::new(rustls_config));
-
-        let app = build_router(self.clone());
-
         let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
-        info!(port, "Web server listening");
+        info!(port, "{label} listening");
 
         loop {
             let (tcp_stream, _remote_addr) = listener.accept().await?;
@@ -124,42 +147,34 @@ impl WebServer {
             let app = app.clone();
 
             tokio::spawn(async move {
-                // TLS handshake
                 let tls_stream = match acceptor.accept(tcp_stream).await {
                     Ok(s) => s,
-                    Err(e) => {
-                        tracing::debug!(error = %e, "TLS handshake failed");
-                        return;
-                    }
+                    Err(e) => { tracing::debug!(error = %e, "TLS handshake failed"); return; }
                 };
 
-                // Extract client cert fingerprint from the TLS session
                 let fingerprint = tls_stream
-                    .get_ref()
-                    .1
+                    .get_ref().1
                     .peer_certificates()
                     .and_then(|certs| certs.first())
                     .map(|cert| crate::cert_fingerprint(cert.as_ref()));
                 let client_fp = ClientFingerprint(fingerprint);
 
-                // Wrap the axum router so we can inject the fingerprint extension
-                let service = hyper::service::service_fn(
-                    move |req: Request<hyper::body::Incoming>| {
-                        let mut app = app.clone();
-                        let fp = client_fp.clone();
-                        async move {
-                            use tower::Service;
-                            let (mut parts, body) = req.into_parts();
-                            parts.extensions.insert(fp);
-                            let req = Request::from_parts(parts, Body::new(body));
-                            app.call(req).await.map_err(|e| match e {})
-                        }
-                    },
-                );
+                let service = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                    let mut app = app.clone();
+                    let fp = client_fp.clone();
+                    async move {
+                        use tower::Service;
+                        let (mut parts, body) = req.into_parts();
+                        parts.extensions.insert(fp);
+                        let req = Request::from_parts(parts, Body::new(body));
+                        app.call(req).await.map_err(|e| match e {})
+                    }
+                });
 
                 let io = TokioIo::new(tls_stream);
-                let conn = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
-                if let Err(e) = conn.serve_connection(io, service).await {
+                if let Err(e) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(io, service).await
+                {
                     tracing::debug!(error = %e, "HTTP connection error");
                 }
             });
@@ -167,29 +182,26 @@ impl WebServer {
     }
 }
 
-/// Build the axum Router with all routes. Extracted as a standalone function
-/// so tests can call handlers directly (via `tower::ServiceExt::oneshot`)
-/// without TLS.
+/// Build the full-access router (member auth, all write endpoints).
 pub(crate) fn build_router(state: AppState) -> Router {
-    // Enrollment routes — unauthenticated
     let enroll_routes = Router::new()
         .route("/enroll", get(handle_enroll_page))
-        .route("/enroll", post(handle_enroll_submit));
+        .route("/enroll", post(handle_enroll_submit))
+        // Viewer enrollment is also available on the main port for local admins.
+        .route("/enroll-viewer", get(handle_viewer_enroll_page))
+        .route("/enroll-viewer", post(handle_viewer_enroll_submit));
 
-    // Authenticated API routes — protected by auth_middleware
     let api_routes = Router::new()
         .route("/", get(handle_index))
+        .route("/api/config", get(handle_config_member))
         .route("/api/ls", get(handle_ls))
         .route("/api/file", get(handle_download))
         .route("/api/meta", get(handle_meta))
         .route("/api/upload", post(handle_upload))
         .route("/api/file", delete(handle_delete))
         .route("/api/mkdir", post(handle_mkdir))
-        .layer(DefaultBodyLimit::max(256 * 1024 * 1024)) // 256 MB upload limit
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ));
+        .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     Router::new()
         .merge(enroll_routes)
@@ -197,8 +209,27 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Middleware that checks `ClientFingerprint` against PeerAuth.
-/// Returns 403 if no valid client cert or not whitelisted.
+/// Build the read-only viewer router (viewer auth, no write endpoints).
+pub(crate) fn build_viewer_router(state: AppState) -> Router {
+    let enroll_routes = Router::new()
+        .route("/enroll-viewer", get(handle_viewer_enroll_page))
+        .route("/enroll-viewer", post(handle_viewer_enroll_submit));
+
+    let api_routes = Router::new()
+        .route("/", get(handle_index))
+        .route("/api/config", get(handle_config_viewer))
+        .route("/api/ls", get(handle_ls))
+        .route("/api/file", get(handle_download))
+        .route("/api/meta", get(handle_meta))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), viewer_auth_middleware));
+
+    Router::new()
+        .merge(enroll_routes)
+        .merge(api_routes)
+        .with_state(state)
+}
+
+/// Middleware that checks `ClientFingerprint` against PeerAuth (member access).
 async fn auth_middleware(
     State(state): State<AppState>,
     req: Request,
@@ -208,19 +239,35 @@ async fn auth_middleware(
         .extensions()
         .get::<ClientFingerprint>()
         .and_then(|cf| cf.0.as_ref())
-        .map(|fp| {
-            matches!(
-                state.peer_auth.check(fp),
-                crate::net::peer_auth::AuthResult::Allowed
-            )
-        })
+        .map(|fp| matches!(state.peer_auth.check(fp), crate::net::peer_auth::AuthResult::Allowed))
         .unwrap_or(false);
 
-    if allowed {
-        next.run(req).await
-    } else {
-        (StatusCode::FORBIDDEN, "Forbidden").into_response()
-    }
+    if allowed { next.run(req).await } else { (StatusCode::FORBIDDEN, "Forbidden").into_response() }
+}
+
+/// Middleware that checks `ClientFingerprint` for viewer access.
+/// Viewer certs AND member certs are both accepted.
+async fn viewer_auth_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let allowed = req
+        .extensions()
+        .get::<ClientFingerprint>()
+        .and_then(|cf| cf.0.as_ref())
+        .map(|fp| state.peer_auth.is_viewer(fp))
+        .unwrap_or(false);
+
+    if allowed { next.run(req).await } else { (StatusCode::FORBIDDEN, "Forbidden").into_response() }
+}
+
+async fn handle_config_member(_: State<AppState>) -> impl IntoResponse {
+    axum::Json(ConfigResponse { readonly: false })
+}
+
+async fn handle_config_viewer(_: State<AppState>) -> impl IntoResponse {
+    axum::Json(ConfigResponse { readonly: true })
 }
 
 /// Generate a random 6-character alphanumeric token.
@@ -430,6 +477,132 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
+// ---- Viewer Enrollment Handlers ----
+
+async fn handle_viewer_enroll_page(State(state): State<AppState>) -> impl IntoResponse {
+    let web_token = gen_token();
+    let console_token = gen_token();
+
+    println!("\n===================================");
+    println!("  Viewer Cert Enrollment Code");
+    println!("  Code: {console_token}");
+    println!("  Expires in 5 minutes.");
+    println!("  (Read-only access on this node)");
+    println!("===================================\n");
+
+    *state.viewer_enrollment.lock() = Some(EnrollmentTokenPair {
+        web_token: web_token.clone(),
+        console_token,
+        expires: Instant::now() + std::time::Duration::from_secs(300),
+    });
+
+    Html(format!(
+        r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NetFuse - Viewer Enrollment</title>
+<style>
+body {{ font-family: -apple-system, sans-serif; background: #f5f5f5; display: flex; justify-content: center; padding-top: 80px; }}
+.card {{ background: #fff; padding: 32px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); max-width: 400px; width: 100%; }}
+h2 {{ margin-bottom: 16px; color: #2c3e50; }}
+p {{ color: #555; margin-bottom: 16px; line-height: 1.5; }}
+.badge {{ display: inline-block; background: #27ae60; color: #fff; font-size: 0.75em; padding: 2px 10px; border-radius: 10px; margin-left: 8px; vertical-align: middle; }}
+input[type=text] {{ width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 1.1em; letter-spacing: 4px; text-align: center; margin-bottom: 16px; }}
+button {{ width: 100%; padding: 12px; background: #27ae60; color: #fff; border: none; border-radius: 4px; font-size: 1em; cursor: pointer; }}
+button:hover {{ background: #219a52; }}
+</style></head><body>
+<div class="card">
+<h2>NetFuse Viewer Enrollment <span class="badge">Read-only</span></h2>
+<p>A confirmation code has been printed on the server console. Enter it below to receive your viewer certificate.</p>
+<p style="color:#888;font-size:0.9em">Viewer certificates grant read-only access to this server's files. They are not network members.</p>
+<form method="POST" action="/enroll-viewer">
+<input type="hidden" name="web_token" value="{web_token}">
+<input type="text" name="console_token" placeholder="Enter code" maxlength="6" autofocus>
+<button type="submit">Get Viewer Certificate</button>
+</form>
+</div></body></html>"#
+    ))
+}
+
+async fn handle_viewer_enroll_submit(
+    State(state): State<AppState>,
+    axum::extract::Form(form): axum::extract::Form<EnrollForm>,
+) -> impl IntoResponse {
+    let valid = {
+        let guard = state.viewer_enrollment.lock();
+        if let Some(ref pair) = *guard {
+            pair.web_token == form.web_token
+                && pair.console_token == form.console_token
+                && Instant::now() < pair.expires
+        } else {
+            false
+        }
+    };
+
+    if !valid {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Html("<html><body><h2>Invalid or expired enrollment token.</h2><p><a href=\"/enroll-viewer\">Try again</a></p></body></html>".to_string()),
+        ).into_response();
+    }
+
+    *state.viewer_enrollment.lock() = None;
+
+    let short_id = gen_token();
+    let client_name = format!("viewer-{short_id}");
+    let (cert_der, key_der) = match crate::config::keys::NodeIdentity::generate_client_identity(&client_name) {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(error = %e, "Failed to generate viewer identity");
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                Html("<html><body><h2>Failed to generate certificate.</h2></body></html>".to_string()))
+                .into_response();
+        }
+    };
+
+    let fingerprint = crate::cert_fingerprint(&cert_der);
+    state.peer_auth.register_viewer(&fingerprint, &client_name);
+    info!(name = %client_name, fingerprint = &fingerprint[..16], "Viewer cert enrolled");
+
+    let pem = match build_pem(&cert_der, &key_der) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "Failed to build viewer PEM");
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                Html("<html><body><h2>Failed to build certificate bundle.</h2></body></html>".to_string()))
+                .into_response();
+        }
+    };
+
+    let pem_b64 = base64_encode(pem.as_bytes());
+    Html(format!(
+        r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NetFuse - Viewer Enrolled</title>
+<style>
+body {{ font-family: -apple-system, sans-serif; background: #f5f5f5; display: flex; justify-content: center; padding-top: 80px; }}
+.card {{ background: #fff; padding: 32px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); max-width: 480px; width: 100%; }}
+h2 {{ margin-bottom: 16px; color: #27ae60; }}
+p {{ color: #555; margin-bottom: 12px; line-height: 1.5; }}
+code {{ background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }}
+a.btn {{ display: inline-block; padding: 10px 20px; background: #27ae60; color: #fff; text-decoration: none; border-radius: 4px; margin-top: 8px; }}
+a.btn:hover {{ background: #219a52; }}
+</style></head><body>
+<div class="card">
+<h2>Viewer Enrollment Successful</h2>
+<p>Your viewer certificate <code>{client_name}.pem</code> should download automatically. It grants read-only access to this server.</p>
+<p>If not, <a class="btn" download="{client_name}.pem" href="data:application/x-pem-file;base64,{pem_b64}">Download Certificate</a></p>
+<p>To use with curl: <code>curl --cert {client_name}.pem -k https://HOST:PORT/api/ls?path=/</code></p>
+</div>
+<script>
+var a = document.createElement('a');
+a.href = 'data:application/x-pem-file;base64,{pem_b64}';
+a.download = '{client_name}.pem';
+document.body.appendChild(a); a.click(); document.body.removeChild(a);
+</script>
+</body></html>"#
+    )).into_response()
+}
+
 // ---- Authenticated Handlers ----
 
 async fn handle_index(State(_state): State<AppState>) -> impl IntoResponse {
@@ -473,6 +646,7 @@ async fn handle_ls(
 async fn handle_download(
     State(state): State<AppState>,
     Query(q): Query<PathQuery>,
+    req_headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let path = normalize_file_path(&q.path);
     match state.db.get_entry(&path) {
@@ -480,25 +654,51 @@ async fn handle_download(
             if entry.kind != EntryKind::File {
                 return (StatusCode::BAD_REQUEST, "Not a file").into_response();
             }
-            if let Some(hash) = &entry.hash {
-                match state.store.get(hash) {
-                    Ok(data) => {
-                        let filename = path.rsplit('/').next().unwrap_or("download");
-                        Response::builder()
-                            .status(StatusCode::OK)
-                            .header(header::CONTENT_TYPE, "application/octet-stream")
-                            .header(
-                                header::CONTENT_DISPOSITION,
-                                format!("attachment; filename=\"{filename}\""),
-                            )
-                            .body(Body::from(data))
-                            .unwrap()
-                            .into_response()
-                    }
-                    Err(_) => (StatusCode::NOT_FOUND, "Blob not found locally").into_response(),
-                }
+            let Some(hash) = &entry.hash else {
+                return (StatusCode::NOT_FOUND, "File has no content").into_response();
+            };
+            let data = match state.store.get(hash) {
+                Ok(d) => d,
+                Err(_) => return (StatusCode::NOT_FOUND, "Blob not found locally").into_response(),
+            };
+            let filename = path.rsplit('/').next().unwrap_or("download");
+            let mime = mime_type(filename);
+            let is_media = mime.starts_with("audio/") || mime.starts_with("video/");
+            let disposition = if is_media {
+                "inline".to_string()
             } else {
-                (StatusCode::NOT_FOUND, "File has no content").into_response()
+                format!("attachment; filename=\"{filename}\"")
+            };
+
+            // Support Range requests (required for audio seeking).
+            let range = req_headers
+                .get(header::RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| parse_range(s, data.len()));
+
+            if let Some((start, end)) = range {
+                let slice = data[start..=end].to_vec();
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONTENT_TYPE, mime)
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{}", data.len()))
+                    .header(header::CONTENT_LENGTH, slice.len())
+                    .header(header::CONTENT_DISPOSITION, disposition)
+                    .body(Body::from(slice))
+                    .unwrap()
+                    .into_response()
+            } else {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, mime)
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .header(header::CONTENT_LENGTH, data.len())
+                    .header(header::CONTENT_DISPOSITION, disposition)
+                    .header(header::CACHE_CONTROL, "public, max-age=86400")
+                    .body(Body::from(data))
+                    .unwrap()
+                    .into_response()
             }
         }
         Ok(None) => (StatusCode::NOT_FOUND, "File not found").into_response(),
@@ -655,6 +855,67 @@ async fn handle_mkdir(
     let _ = state.sync_tx.send(SyncEvent::DirCreated(entry));
 
     (StatusCode::OK, "Created").into_response()
+}
+
+/// Map a filename extension to a MIME type string.
+fn mime_type(filename: &str) -> &'static str {
+    let ext = filename.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        // Audio
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "ogg" | "oga" => "audio/ogg",
+        "flac" => "audio/flac",
+        "wav" => "audio/wav",
+        "opus" => "audio/opus",
+        "aac" => "audio/aac",
+        "weba" => "audio/webm",
+        // Video
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "ogv" => "video/ogg",
+        "mov" => "video/quicktime",
+        "avi" => "video/x-msvideo",
+        "mkv" => "video/x-matroska",
+        // Images
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        // Text / code
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "application/javascript",
+        "json" => "application/json",
+        "txt" | "md" | "rst" => "text/plain; charset=utf-8",
+        "xml" => "application/xml",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "tar" => "application/x-tar",
+        "gz" => "application/gzip",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Parse an HTTP `Range: bytes=start-end` header value.
+/// Returns `(start, end)` as inclusive byte indices, clamped to `[0, total-1]`.
+/// Returns `None` if the header cannot be parsed or describes a zero-length range.
+fn parse_range(header: &str, total: usize) -> Option<(usize, usize)> {
+    let s = header.strip_prefix("bytes=")?;
+    let (start_str, end_str) = s.split_once('-')?;
+    let start: usize = start_str.trim().parse().ok()?;
+    let end: usize = if end_str.trim().is_empty() {
+        total.saturating_sub(1)
+    } else {
+        end_str.trim().parse().ok()?
+    };
+    if start > end || start >= total {
+        return None;
+    }
+    let end = end.min(total - 1);
+    Some((start, end))
 }
 
 /// Normalize a path to have a leading '/' and no trailing '/'.

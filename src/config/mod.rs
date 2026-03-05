@@ -24,6 +24,8 @@ pub struct ConfigFile {
     /// enabling deletion inference across nodes that never directly connected.
     /// Disable to trade correctness (file resurrection) for smaller sync messages.
     pub propagate_peer_states: Option<bool>,
+    /// Port for the read-only HTTPS viewer endpoint (disabled by default).
+    pub viewer_port: Option<u16>,
 }
 
 impl ConfigFile {
@@ -91,6 +93,11 @@ pub struct CliArgs {
     /// Set to false if sync message size is a concern (risks file resurrection).
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub propagate_peer_states: Option<bool>,
+
+    /// Port for the read-only HTTPS viewer endpoint (disabled by default).
+    /// When set, starts a second listener with viewer-cert auth and no write access.
+    #[arg(long)]
+    pub viewer_port: Option<u16>,
 }
 
 /// Resolved application configuration.
@@ -110,6 +117,8 @@ pub struct AppConfig {
     pub eviction_interval_secs: u64,
     pub web_port: u16,
     pub propagate_peer_states: bool,
+    /// `None` means the viewer endpoint is disabled.
+    pub viewer_port: Option<u16>,
 }
 
 impl AppConfig {
@@ -187,6 +196,7 @@ impl AppConfig {
                 .propagate_peer_states
                 .or(cfg.propagate_peer_states)
                 .unwrap_or(true),
+            viewer_port: args.viewer_port.or(cfg.viewer_port),
         })
     }
 

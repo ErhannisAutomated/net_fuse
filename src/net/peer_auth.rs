@@ -37,11 +37,13 @@ pub enum AuthResult {
     Pending,
 }
 
-/// Persisted authorization data (whitelist + blacklist).
+/// Persisted authorization data (whitelist + blacklist + viewer certs).
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct PeerAuthData {
     whitelist: HashMap<String, PeerRecord>,
     blacklist: HashMap<String, PeerRecord>,
+    #[serde(default)]
+    viewer_certs: HashMap<String, PeerRecord>,
 }
 
 /// Manages peer authorization: persistent whitelist/blacklist + session-only decisions.
@@ -52,6 +54,8 @@ pub struct PeerAuth {
     blacklist: Mutex<HashMap<String, PeerRecord>>,
     session_allowed: Mutex<HashSet<String>>,
     session_ignored: Mutex<HashSet<String>>,
+    /// Viewer certs: read-only web access, not network membership.
+    viewer_certs: Mutex<HashMap<String, PeerRecord>>,
     pending_tx: mpsc::UnboundedSender<PendingPeer>,
     /// Notified when a peer is allowed (Whitelist or SessionAllow), so PeerManager
     /// can immediately retry pending connections instead of waiting for mDNS.
@@ -73,6 +77,7 @@ impl PeerAuth {
             blacklist: Mutex::new(data.blacklist),
             session_allowed: Mutex::new(HashSet::new()),
             session_ignored: Mutex::new(HashSet::new()),
+            viewer_certs: Mutex::new(data.viewer_certs),
             pending_tx,
             approved_tx: Mutex::new(None),
         }
@@ -104,6 +109,27 @@ impl PeerAuth {
             return AuthResult::Denied;
         }
         AuthResult::Pending
+    }
+
+    /// Register a viewer certificate (persistent, read-only web access on this node).
+    pub fn register_viewer(&self, fingerprint: &str, name: &str) {
+        self.viewer_certs.lock().insert(
+            fingerprint.to_string(),
+            PeerRecord {
+                name: name.to_string(),
+                first_seen: chrono_now(),
+            },
+        );
+        self.save();
+        info!(fingerprint = &fingerprint[..16], name, "Viewer cert registered");
+    }
+
+    /// Check whether a fingerprint has viewer-level access (read-only web).
+    /// Network members (whitelist / session-allowed) are also considered viewers.
+    pub fn is_viewer(&self, fingerprint: &str) -> bool {
+        self.viewer_certs.lock().contains_key(fingerprint)
+            || self.whitelist.lock().contains_key(fingerprint)
+            || self.session_allowed.lock().contains(fingerprint)
     }
 
     /// Submit a pending peer for user review.
@@ -174,6 +200,7 @@ impl PeerAuth {
         let data = PeerAuthData {
             whitelist: self.whitelist.lock().clone(),
             blacklist: self.blacklist.lock().clone(),
+            viewer_certs: self.viewer_certs.lock().clone(),
         };
         match serde_json::to_string_pretty(&data) {
             Ok(json) => {

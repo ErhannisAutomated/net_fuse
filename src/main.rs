@@ -149,13 +149,25 @@ async fn main() -> Result<()> {
         identity.clone(),
     ));
     let web_port = config.web_port;
+    let web_server_main = web_server.clone();
     tokio::spawn(async move {
-        if let Err(e) = web_server.run(web_port).await {
+        if let Err(e) = web_server_main.run(web_port).await {
             tracing::error!(error = %e, "Web server failed");
         }
     });
     println!("Web interface: https://localhost:{}", config.web_port);
     println!("Enroll at: https://localhost:{}/enroll", config.web_port);
+
+    if let Some(viewer_port) = config.viewer_port {
+        let ws = web_server.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ws.run_viewer(viewer_port).await {
+                tracing::error!(error = %e, "Viewer web server failed");
+            }
+        });
+        println!("Viewer interface: https://localhost:{}", viewer_port);
+        println!("Viewer enroll at: https://localhost:{}/enroll-viewer", viewer_port);
+    }
 
     // --- Phase 5: Cache Eviction ---
 
