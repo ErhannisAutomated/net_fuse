@@ -23,6 +23,7 @@ use crate::config::keys::NodeIdentity;
 use crate::metadata::types::{EntryKind, FileEntry};
 use crate::metadata::MetadataDb;
 use crate::net::peer_auth::PeerAuth;
+use crate::net::transport::Transport;
 use crate::store::BlobStore;
 use crate::sync::SyncEvent;
 
@@ -57,6 +58,8 @@ pub struct WebServer {
     /// Separate token pair for viewer-cert enrollment.
     viewer_enrollment: Mutex<Option<EnrollmentTokenPair>>,
     identity: Arc<NodeIdentity>,
+    /// QUIC transport for fetching blobs from peers when not cached locally.
+    transport: Option<Arc<Transport>>,
 }
 
 type AppState = Arc<WebServer>;
@@ -104,6 +107,7 @@ impl WebServer {
         sync_tx: mpsc::UnboundedSender<SyncEvent>,
         node_id: Uuid,
         identity: Arc<NodeIdentity>,
+        transport: Option<Arc<Transport>>,
     ) -> Self {
         Self {
             db,
@@ -114,6 +118,7 @@ impl WebServer {
             enrollment: Mutex::new(None),
             viewer_enrollment: Mutex::new(None),
             identity,
+            transport,
         }
     }
 
@@ -659,7 +664,31 @@ async fn handle_download(
             };
             let data = match state.store.get(hash) {
                 Ok(d) => d,
-                Err(_) => return (StatusCode::NOT_FOUND, "Blob not found locally").into_response(),
+                Err(_) => {
+                    // Blob not cached locally — try fetching from connected peers.
+                    if let Some(transport) = &state.transport {
+                        let origin = entry.origin_node;
+                        match fetch_blob_from_peers(transport, origin, hash).await {
+                            Ok(d) => {
+                                // Cache locally for subsequent requests.
+                                if let Ok((_, blob_size)) = state.store.store_bytes(&d) {
+                                    let blob_path = format!(
+                                        "{}/{}",
+                                        &hex::encode(hash)[..2],
+                                        hex::encode(hash)
+                                    );
+                                    let _ = state.db.register_blob(hash, blob_size, &blob_path);
+                                }
+                                d
+                            }
+                            Err(_) => {
+                                return (StatusCode::NOT_FOUND, "Blob not available locally or from peers").into_response();
+                            }
+                        }
+                    } else {
+                        return (StatusCode::NOT_FOUND, "Blob not found locally").into_response();
+                    }
+                }
             };
             let filename = path.rsplit('/').next().unwrap_or("download");
             let mime = mime_type(filename);
@@ -857,6 +886,29 @@ async fn handle_mkdir(
     (StatusCode::OK, "Created").into_response()
 }
 
+/// Fetch a blob from peers, trying the origin node first then all others.
+async fn fetch_blob_from_peers(
+    transport: &Transport,
+    origin: Uuid,
+    hash: &crate::BlobHash,
+) -> anyhow::Result<Vec<u8>> {
+    if transport.is_connected(&origin).await {
+        if let Ok(data) = transport.fetch_blob(origin, hash).await {
+            return Ok(data);
+        }
+    }
+    let peers = transport.connected_peers().await;
+    for (peer_id, _) in peers {
+        if peer_id == origin {
+            continue;
+        }
+        if let Ok(data) = transport.fetch_blob(peer_id, hash).await {
+            return Ok(data);
+        }
+    }
+    anyhow::bail!("no peer has blob {}", hex::encode(hash))
+}
+
 /// Map a filename extension to a MIME type string.
 fn mime_type(filename: &str) -> &'static str {
     let ext = filename.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
@@ -964,7 +1016,7 @@ mod tests {
         std::mem::forget(tmp);
 
         Arc::new(WebServer::new(
-            db, store, peer_auth, sync_tx, node_id, identity,
+            db, store, peer_auth, sync_tx, node_id, identity, None,
         ))
     }
 

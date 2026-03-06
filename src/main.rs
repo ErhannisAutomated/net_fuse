@@ -147,6 +147,7 @@ async fn main() -> Result<()> {
         sync_tx.clone(),
         node_id,
         identity.clone(),
+        Some(transport.clone()),
     ));
     let web_port = config.web_port;
     let web_server_main = web_server.clone();

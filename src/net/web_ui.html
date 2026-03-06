@@ -59,15 +59,15 @@ td a:hover { text-decoration: underline; }
 .player-controls button:hover { background: rgba(255,255,255,0.12); }
 .player-track { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   font-size: 0.87em; opacity: 0.88; }
-.player-progress { display: flex; align-items: center; gap: 7px; flex-shrink: 0; }
-.player-seek { width: 140px; accent-color: #3498db; cursor: pointer; vertical-align: middle; }
+.player-progress { display: flex; align-items: center; gap: 7px; flex: 1; min-width: 0; }
+.player-seek { flex: 1; min-width: 40px; accent-color: #3498db; cursor: pointer; vertical-align: middle; }
 .player-time { font-size: 0.78em; opacity: 0.68; font-variant-numeric: tabular-nums; white-space: nowrap; }
 /* responsive */
 @media (max-width: 600px) {
   .toolbar { padding: 8px 10px; }
   .container { padding: 0 10px 10px; }
   th, td { padding: 8px 6px; font-size: 0.85em; }
-  .player-seek { width: 80px; }
+  .player-seek { min-width: 40px; }
   .player-time { display: none; }
 }
 </style>
@@ -112,6 +112,7 @@ td a:hover { text-decoration: underline; }
     <button onclick="playerPrev()" title="Previous">&#9198;</button>
     <button id="playPauseBtn" onclick="playerToggle()" title="Play / Pause">&#9654;</button>
     <button onclick="playerNext()" title="Next">&#9197;</button>
+    <button id="loopBtn" onclick="cycleLoop()" title="Loop mode">&#8635;</button>
   </div>
   <div class="player-track" id="playerTrack">&#8212;</div>
   <div class="player-progress">
@@ -309,6 +310,11 @@ document.getElementById('mkdirName').addEventListener('keydown', e => {
 const audioEl = document.getElementById('audioEl');
 let playerQueue = [];
 let playerIndex = -1;
+// Loop modes: 0 = off, 1 = loop directory, 2 = loop single
+let loopMode = 0;
+const LOOP_ICONS  = ['\u{1F501}', '\u{1F501}', '\u{1F502}']; // 🔁 🔁 🔂
+const LOOP_LABELS = ['Loop: off', 'Loop: all', 'Loop: one'];
+const LOOP_STYLES = ['opacity:0.38', 'opacity:1', 'opacity:1'];
 
 function fmtDur(s) {
   if (!s || isNaN(s)) return '0:00';
@@ -345,11 +351,26 @@ function playerToggle() {
 function playerPrev() { if (playerIndex > 0) playerLoad(playerIndex - 1); }
 function playerNext() { if (playerIndex < playerQueue.length - 1) playerLoad(playerIndex + 1); }
 
+function cycleLoop() {
+  loopMode = (loopMode + 1) % 3;
+  const btn = document.getElementById('loopBtn');
+  btn.textContent = LOOP_ICONS[loopMode];
+  btn.title = LOOP_LABELS[loopMode];
+  btn.style.cssText = LOOP_STYLES[loopMode];
+  audioEl.loop = (loopMode === 2);
+}
+
 audioEl.addEventListener('play',  updatePlayerUI);
 audioEl.addEventListener('pause', updatePlayerUI);
 audioEl.addEventListener('ended', () => {
-  if (playerIndex < playerQueue.length - 1) playerLoad(playerIndex + 1);
-  else updatePlayerUI();
+  if (loopMode === 2) { /* audioEl.loop handles it */ return; }
+  if (playerIndex < playerQueue.length - 1) {
+    playerLoad(playerIndex + 1);
+  } else if (loopMode === 1 && playerQueue.length > 0) {
+    playerLoad(0);
+  } else {
+    updatePlayerUI();
+  }
 });
 audioEl.addEventListener('timeupdate', () => {
   const dur = audioEl.duration;
@@ -418,6 +439,11 @@ async function init() {
     document.querySelectorAll('.write-only').forEach(el => el.style.display = 'none');
     document.getElementById('readonlyBadge').style.display = '';
   }
+  // Set initial loop button appearance
+  const loopBtn = document.getElementById('loopBtn');
+  loopBtn.textContent = LOOP_ICONS[loopMode];
+  loopBtn.title = LOOP_LABELS[loopMode];
+  loopBtn.style.cssText = LOOP_STYLES[loopMode];
   await navigate('/');
 }
 init();
