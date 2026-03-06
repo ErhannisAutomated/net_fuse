@@ -26,6 +26,8 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
+                // To suppress mdns-sd's internal chatter (tiebreaking, AAAA records, etc.)
+                // on machines with many virtual interfaces, change "info" to "info,mdns_sd=warn".
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
